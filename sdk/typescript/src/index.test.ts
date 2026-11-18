@@ -332,3 +332,15 @@ test("embed errors surface the envelope, a bad body is invalid and a queued sync
   await assert.rejects(embed().startSync("kb"), ContextApiError);
   assert.equal(seen.length, 1);
 });
+
+test("embed refuses dot segments and unknown sync states", async () => {
+  seen = [];
+  await assert.rejects(embed().getSync("..", "s1"), ContextError);
+  await assert.rejects(embed().search(".", { query: "q" }), ContextError);
+  assert.equal(seen.length, 0);
+  reply = json(200, { ...sync, state: "bogus" });
+  await assert.rejects(
+    embed().getSync("kb", "s1"),
+    ContextInvalidResponseError,
+  );
+});

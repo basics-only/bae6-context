@@ -273,3 +273,21 @@ def test_embed_errors_surface_the_envelope_and_a_queued_sync_is_not_retried() ->
     with pytest.raises(ContextApiError):
         run_embed(unavailable, lambda e: e.start_sync("kb"))
     assert calls == 1
+
+
+def test_embed_refuses_dot_segments_and_unknown_sync_states() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200, json={"id": "s1", "state": "bogus", "prefix": "", "attempts": 0}
+        )
+
+    with pytest.raises(ContextError):
+        run_embed(handler, lambda e: e.get_sync("..", "s1"))
+    with pytest.raises(ContextError):
+        run_embed(handler, lambda e: e.search(".", "q"))
+    assert seen == []
+    with pytest.raises(ContextInvalidResponseError):
+        run_embed(handler, lambda e: e.get_sync("kb", "s1"))

@@ -369,6 +369,17 @@ export class DataClient {
   }
 }
 
+const SYNC_STATES = ["queued", "running", "succeeded", "failed"];
+
+// fetch resolves "." and ".." segments, which would send the request elsewhere.
+function segment(id: string) {
+  if (id === "." || id === "..") {
+    throw new ContextError("not a valid identifier");
+  }
+  return enc(id);
+}
+const collection = (id: string) => `/v1/collections/${segment(id)}`;
+
 /** The embed API acts as the workload token's subject; there is no end-user delegation. */
 export type EmbedCallOptions = Pick<CallOptions, "signal">;
 
@@ -417,10 +428,17 @@ export class EmbedClient {
   ): Promise<Collection> {
     const body = await this.#http.request(
       "PUT",
-      `/v1/collections/${enc(collectionId)}`,
+      collection(collectionId),
       signal(options),
     );
-    if (!isObject(body) || typeof body.dimensions !== "number") throw invalid();
+    if (
+      !isObject(body) ||
+      typeof body.id !== "string" ||
+      typeof body.model !== "string" ||
+      !Number.isInteger(body.dimensions)
+    ) {
+      throw invalid();
+    }
     return body as unknown as Collection;
   }
 
@@ -431,11 +449,10 @@ export class EmbedClient {
     options: EmbedCallOptions = {},
   ): Promise<Sync> {
     return this.#sync(
-      await this.#http.request(
-        "POST",
-        `/v1/collections/${enc(collectionId)}/syncs`,
-        { body: request, ...signal(options) },
-      ),
+      await this.#http.request("POST", `${collection(collectionId)}/syncs`, {
+        body: request,
+        ...signal(options),
+      }),
     );
   }
 
@@ -447,7 +464,7 @@ export class EmbedClient {
     return this.#sync(
       await this.#http.request(
         "GET",
-        `/v1/collections/${enc(collectionId)}/syncs/${enc(syncId)}`,
+        `${collection(collectionId)}/syncs/${segment(syncId)}`,
         signal(options),
       ),
     );
@@ -461,10 +478,13 @@ export class EmbedClient {
   ): Promise<SearchHit[]> {
     const body = await this.#http.request(
       "POST",
-      `/v1/collections/${enc(collectionId)}/search`,
+      `${collection(collectionId)}/search`,
       { body: request, ...signal(options) },
     );
     if (!isObject(body) || !Array.isArray(body.hits)) throw invalid();
+    if (!body.hits.every((h) => isObject(h) && typeof h.chunkId === "string")) {
+      throw invalid();
+    }
     return body.hits as SearchHit[];
   }
 
@@ -476,13 +496,19 @@ export class EmbedClient {
   ): Promise<void> {
     await this.#http.raw(
       "DELETE",
-      `/v1/collections/${enc(collectionId)}/documents?${new URLSearchParams({ key })}`,
+      `${collection(collectionId)}/documents?${new URLSearchParams({ key })}`,
       signal(options),
     );
   }
 
   #sync(body: unknown): Sync {
-    if (!isObject(body) || typeof body.id !== "string") throw invalid();
+    if (
+      !isObject(body) ||
+      typeof body.id !== "string" ||
+      !SYNC_STATES.includes(body.state as string)
+    ) {
+      throw invalid();
+    }
     return body as unknown as Sync;
   }
 }

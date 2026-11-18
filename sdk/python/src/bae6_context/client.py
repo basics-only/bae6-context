@@ -384,8 +384,18 @@ class DataClient:
         )
 
 
+SYNC_STATES = {"queued", "running", "succeeded", "failed"}
+
+
+def _segment(identifier: str) -> str:
+    # httpx resolves "." and ".." segments, which would send the request elsewhere.
+    if identifier in (".", ".."):
+        raise ContextError("not a valid identifier")
+    return quote(identifier, safe="")
+
+
 def _collection(collection_id: str) -> str:
-    return f"/v1/collections/{quote(collection_id, safe='')}"
+    return f"/v1/collections/{_segment(collection_id)}"
 
 
 class EmbedClient:
@@ -421,7 +431,14 @@ class EmbedClient:
     async def create_collection(self, collection_id: str) -> dict[str, Any]:
         """Provisions the configured collection's storage; a no-op when it exists."""
         body = await self._http.request("PUT", _collection(collection_id))
-        if not isinstance(body, dict) or not isinstance(body.get("dimensions"), int):
+        dimensions = body.get("dimensions") if isinstance(body, dict) else None
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("id"), str)
+            or not isinstance(body.get("model"), str)
+            or not isinstance(dimensions, int)
+            or isinstance(dimensions, bool)
+        ):
             raise _invalid()
         return body
 
@@ -438,7 +455,7 @@ class EmbedClient:
 
     async def get_sync(self, collection_id: str, sync_id: str) -> dict[str, Any]:
         body = await self._http.request(
-            "GET", f"{_collection(collection_id)}/syncs/{quote(sync_id, safe='')}"
+            "GET", f"{_collection(collection_id)}/syncs/{_segment(sync_id)}"
         )
         return _sync(body)
 
@@ -454,6 +471,11 @@ class EmbedClient:
         )
         if not isinstance(body, dict) or not isinstance(body.get("hits"), list):
             raise _invalid()
+        if not all(
+            isinstance(h, dict) and isinstance(h.get("chunkId"), str)
+            for h in body["hits"]
+        ):
+            raise _invalid()
         return body["hits"]
 
     async def delete_document(self, collection_id: str, key: str) -> None:
@@ -464,7 +486,11 @@ class EmbedClient:
 
 
 def _sync(body: object) -> dict[str, Any]:
-    if not isinstance(body, dict) or not isinstance(body.get("id"), str):
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("id"), str)
+        or body.get("state") not in SYNC_STATES
+    ):
         raise _invalid()
     return body
 
