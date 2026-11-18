@@ -54,6 +54,12 @@ export interface ReadRequest {
   signal?: AbortSignal;
 }
 
+export interface StatRequest {
+  key: string;
+  versionId?: string;
+  signal?: AbortSignal;
+}
+
 export interface QuerySource {
   capabilities(): CapabilityDescriptor;
   query(req: QueryRequest): Promise<QueryResult>;
@@ -63,8 +69,10 @@ export interface QuerySource {
 export interface ObjectSource {
   capabilities(): CapabilityDescriptor;
   list(req: ListRequest): Promise<{ items: ObjectInfo[]; nextCursor?: string }>;
+  /** Refuses (`too_large`) an object or range over the adapter's byte limit. */
   read(req: ReadRequest): Promise<{ info: ObjectInfo; body: Uint8Array }>;
-  stat(key: string, signal?: AbortSignal): Promise<ObjectInfo>;
+  stat(req: StatRequest): Promise<ObjectInfo>;
+  close(): Promise<void>;
 }
 
 export type DataErrorCode =
@@ -72,6 +80,7 @@ export type DataErrorCode =
   | "forbidden"
   | "not_found"
   | "timeout"
+  | "cancelled"
   | "unavailable"
   | "too_large";
 
@@ -122,8 +131,30 @@ export function checkQuery(req: QueryRequest, limits: QueryLimits) {
       `timeoutMs must be 1 to ${limits.maxTimeoutMs}.`,
     );
   }
-  const params = req.parameters ?? [];
-  const values = Array.isArray(params) ? params : Object.values(params);
+  const params: unknown = req.parameters ?? [];
+  if (
+    typeof params !== "object" ||
+    params === null ||
+    (!Array.isArray(params) &&
+      Object.getPrototypeOf(params) !== Object.prototype)
+  ) {
+    throw new DataError(
+      "invalid_request",
+      "parameters must be an array or a plain object.",
+    );
+  }
+  if (
+    req.delegatedToken !== undefined &&
+    (typeof req.delegatedToken !== "string" ||
+      req.delegatedToken.length === 0 ||
+      req.delegatedToken.length > 8192)
+  ) {
+    throw new DataError(
+      "invalid_request",
+      "delegatedToken must be 1 to 8192 characters.",
+    );
+  }
+  const values = Object.values(params);
   if (
     values.length > 256 ||
     !values.every(
@@ -147,6 +178,12 @@ export function checkQuery(req: QueryRequest, limits: QueryLimits) {
       : AbortSignal.timeout(timeoutMs),
   };
 }
+
+/** The error for an aborted call: the caller's own abort is `cancelled`, anything else `timeout`. */
+export const abortError = (callerSignal: AbortSignal | undefined) =>
+  callerSignal?.aborted
+    ? new DataError("cancelled", "The caller cancelled the request.")
+    : new DataError("timeout", "The request timed out.");
 
 /** Bytes a row adds to the JSON response; used for the byte limit. */
 export const rowBytes = (row: (string | null)[]) =>

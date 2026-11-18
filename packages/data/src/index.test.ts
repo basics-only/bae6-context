@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { checkQuery, DataError } from "./index.js";
+import { abortError, checkQuery, DataError } from "./index.js";
 
 const limits = {
   maxRows: 100,
@@ -36,6 +36,10 @@ test("refuses requests over the limits instead of clamping them", () => {
     { statement: "SELECT 1", parameters: [Number.NaN] },
     { statement: "SELECT 1", parameters: { a: {} as unknown as string } },
     { statement: "SELECT 1", parameters: Array(257).fill(1) },
+    { statement: "SELECT 1", parameters: "abc" as unknown as string[] },
+    { statement: "SELECT 1", parameters: new Map() as unknown as string[] },
+    { statement: "SELECT 1", delegatedToken: "" },
+    { statement: "SELECT 1", delegatedToken: "x".repeat(8193) },
   ]) {
     assert.equal(
       code(() => checkQuery(req, limits)),
@@ -55,4 +59,12 @@ test("the caller's signal and the timeout both abort", async () => {
   const t = checkQuery({ statement: "SELECT 1", timeoutMs: 1 }, limits);
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(t.signal.aborted, true);
+});
+
+test("a caller abort is cancelled; any other abort is a timeout", () => {
+  const caller = new AbortController();
+  assert.equal(abortError(caller.signal).code, "timeout");
+  caller.abort();
+  assert.equal(abortError(caller.signal).code, "cancelled");
+  assert.equal(abortError(undefined).code, "timeout");
 });
