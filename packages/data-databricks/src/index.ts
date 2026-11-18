@@ -37,7 +37,7 @@ const ID = /^[a-z0-9][a-z0-9._:/-]{0,127}$/;
 const WAREHOUSE = /^[A-Za-z0-9]{1,64}$/;
 const PARAM = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 const CHUNK_LINK =
-  /^\/api\/2\.0\/sql\/statements\/[A-Za-z0-9-]{1,128}\/result\/chunks\/\d{1,6}(\?[A-Za-z0-9=&_.-]{0,512})?$/;
+  /^\/api\/2\.0\/sql\/statements\/([A-Za-z0-9-]{1,128})\/result\/chunks\/(\d{1,6})(\?[A-Za-z0-9=&_.-]{0,512})?$/;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_LIMITS: QueryLimits = {
   maxRows: 10_000,
@@ -66,12 +66,23 @@ interface Chunk {
   next_chunk_internal_link?: string;
 }
 
-async function readJson(res: Response): Promise<unknown> {
+async function readJson(
+  res: Response,
+  signal: AbortSignal,
+  callerSignal: AbortSignal | undefined,
+): Promise<Record<string, unknown>> {
   const reader = res.body?.getReader();
   const parts: Uint8Array[] = [];
   let size = 0;
   for (;;) {
-    const r = reader ? await reader.read() : { done: true as const };
+    let r: ReadableStreamReadResult<Uint8Array>;
+    try {
+      r = reader ? await reader.read() : { done: true, value: undefined };
+    } catch {
+      throw signal.aborted
+        ? abortError(callerSignal)
+        : new DataError("unavailable", "The source connection failed.");
+    }
     if (r.done) break;
     size += r.value.byteLength;
     if (size > MAX_RESPONSE_BYTES) {
@@ -80,15 +91,22 @@ async function readJson(res: Response): Promise<unknown> {
     }
     parts.push(r.value);
   }
+  let json: unknown;
   try {
-    return JSON.parse(Buffer.concat(parts).toString("utf8"));
+    json = JSON.parse(Buffer.concat(parts).toString("utf8"));
   } catch {
+    json = undefined;
+  }
+  if (typeof json !== "object" || json === null || Array.isArray(json)) {
     throw new DataError("unavailable", "The source sent a malformed response.");
   }
+  return json as Record<string, unknown>;
 }
 
 function failed(error: { error_code?: string; message?: string } = {}) {
-  const code = error.error_code ?? "";
+  const raw = error.error_code;
+  // Only a bare code is passed on; anything else could carry SQL or data.
+  const code = typeof raw === "string" && /^[A-Z_]{1,64}$/.test(raw) ? raw : "";
   if (
     code === "PERMISSION_DENIED" ||
     /INSUFFICIENT_PERMISSIONS|PERMISSION_DENIED/.test(error.message ?? "")
@@ -101,7 +119,7 @@ function failed(error: { error_code?: string; message?: string } = {}) {
   // Messages can quote the statement or data, so only the code is passed on.
   return new DataError(
     "invalid_request",
-    `The statement failed${/^[A-Z_]{1,64}$/.test(code) ? ` (${code})` : ""}.`,
+    `The statement failed${code ? ` (${code})` : ""}.`,
   );
 }
 
@@ -127,6 +145,10 @@ export function createDatabricksSource(cfg: DatabricksConfig): QuerySource {
   if (limits.maxTimeoutMs > DEFAULT_LIMITS.maxTimeoutMs) {
     throw new Error(`${cfg.id}: maxTimeoutMs is at most 50000`);
   }
+  // The INLINE disposition's own cap.
+  if (limits.maxBytes > 25 * 1024 * 1024) {
+    throw new Error(`${cfg.id}: maxBytes is at most 25 MiB`);
+  }
   const access: Access =
     cfg.auth.mode === "delegated" ? "delegated" : "service_principal";
 
@@ -136,7 +158,7 @@ export function createDatabricksSource(cfg: DatabricksConfig): QuerySource {
     signal: AbortSignal,
     callerSignal: AbortSignal | undefined,
     body?: unknown,
-  ): Promise<unknown> {
+  ): Promise<Record<string, unknown>> {
     let res: Response;
     try {
       res = await fetch(new URL(path, host), {
@@ -154,8 +176,11 @@ export function createDatabricksSource(cfg: DatabricksConfig): QuerySource {
         ? abortError(callerSignal)
         : new DataError("unavailable", "The source is unreachable.");
     }
-    if (res.ok) return readJson(res);
+    if (res.ok) return readJson(res, signal, callerSignal);
     await res.body?.cancel();
+    // A revoked or rotated service-principal token: fetch a fresh one next time.
+    if (res.status === 401 && access === "service_principal")
+      cached = undefined;
     if (res.status === 403 || (res.status === 401 && access === "delegated")) {
       throw new DataError("forbidden", "The source refused the credential.");
     }
@@ -189,13 +214,16 @@ export function createDatabricksSource(cfg: DatabricksConfig): QuerySource {
           redirect: "error",
           signal: AbortSignal.timeout(10_000),
         });
-        const json = (res.ok ? await readJson(res) : null) as {
-          access_token?: unknown;
-          expires_in?: unknown;
-        } | null;
+        if (!res.ok) {
+          await res.body?.cancel();
+          throw new Error("token endpoint refused");
+        }
+        const own = AbortSignal.timeout(10_000);
+        const json = await readJson(res, own, undefined);
         if (
-          typeof json?.access_token !== "string" ||
-          typeof json.expires_in !== "number"
+          typeof json.access_token !== "string" ||
+          typeof json.expires_in !== "number" ||
+          !Number.isFinite(json.expires_in)
         ) {
           throw new Error("bad token response");
         }
@@ -214,16 +242,19 @@ export function createDatabricksSource(cfg: DatabricksConfig): QuerySource {
       }
     })();
     const token = pending;
-    return Promise.race([
-      token,
-      new Promise<never>((_, reject) =>
-        signal.addEventListener(
-          "abort",
-          () => reject(abortError(callerSignal)),
-          { once: true },
-        ),
-      ),
-    ]);
+    if (signal.aborted) throw abortError(callerSignal);
+    let onAbort = () => {};
+    try {
+      return await Promise.race([
+        token,
+        new Promise<never>((_, reject) => {
+          onAbort = () => reject(abortError(callerSignal));
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
 
   return {
@@ -323,8 +354,16 @@ export function createDatabricksSource(cfg: DatabricksConfig): QuerySource {
       let bytes = 0;
       let truncated = s.manifest?.truncated === true;
       let chunk: Chunk = s.result ?? {};
+      let lastChunk = 0;
       for (;;) {
-        for (const row of chunk.data_array ?? []) {
+        const data = chunk.data_array ?? [];
+        if (!Array.isArray(data)) {
+          throw new DataError(
+            "unavailable",
+            "The source sent a malformed result.",
+          );
+        }
+        for (const row of data) {
           if (
             !Array.isArray(row) ||
             !row.every((v) => v === null || typeof v === "string")
@@ -344,13 +383,16 @@ export function createDatabricksSource(cfg: DatabricksConfig): QuerySource {
         }
         const link = chunk.next_chunk_internal_link;
         if (truncated || link === undefined) break;
-        // Only follow links back to this statement's results, never anywhere else.
-        if (typeof link !== "string" || !CHUNK_LINK.test(link)) {
+        // Only follow links forward through this statement's own results, never anywhere else.
+        const m = typeof link === "string" ? CHUNK_LINK.exec(link) : null;
+        const index = Number(m?.[2]);
+        if (!m || m[1] !== s.statement_id || !(index > lastChunk)) {
           throw new DataError(
             "unavailable",
             "The source sent an unexpected link.",
           );
         }
+        lastChunk = index;
         chunk = (await call(link, bearer, signal, req.signal)) as Chunk;
       }
       return { columns, rows, truncated, access };

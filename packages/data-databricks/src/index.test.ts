@@ -37,7 +37,7 @@ const server = createServer(async (req: IncomingMessage, res) => {
   if (r.delayMs) await new Promise((ok) => setTimeout(ok, r.delayMs));
   if (res.destroyed) return;
   res.writeHead(r.status ?? 200, { "content-type": "application/json" });
-  res.end(JSON.stringify(r.json ?? {}));
+  res.end(JSON.stringify("json" in r ? r.json : {}));
 });
 await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
 const host = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -177,6 +177,14 @@ test("refuses writes and multiple statements without calling the source", async 
     "SELECT 'unterminated",
     "SET spark.sql.ansi.enabled = false",
     "OPTIMIZE t",
+    "WITH a AS (SELECT 1) --x\rINSERT INTO t SELECT * FROM a",
+    "WITH a AS (SELECT r'\\') INSERT INTO t SELECT 1 FROM (SELECT 'x') --'",
+    "SELECT http_request(conn => 'c', method => 'POST', path => '/x')",
+    "SELECT ai_query('endpoint', 'p')",
+    "SELECT * FROM remote_query('conn', query => 'DELETE FROM x')",
+    "SELECT * FROM read_files('s3://other/')",
+    "SELECT secret('scope', 'key')",
+    "SELECT reflect('java.lang.System', 'getenv')",
     "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
   ]) {
     assert.equal(await code(sp().query({ statement })), "forbidden", statement);
@@ -287,4 +295,57 @@ test("refuses a non-https or non-bare host", () => {
       }),
     );
   }
+});
+
+test("only follows links forward through the same statement's chunks", async () => {
+  for (const link of [
+    "/api/2.0/sql/statements/other-id/result/chunks/1",
+    "/api/2.0/sql/statements/01ef-aa/result/chunks/0",
+  ]) {
+    handler = () => ok([["1"]], { next_chunk_internal_link: link });
+    assert.equal(
+      await code(sp().query({ statement: "SELECT 1" })),
+      "unavailable",
+      link,
+    );
+  }
+  assert.equal(seen.filter((s) => s.method === "GET").length, 0);
+});
+
+test("malformed bodies and a code carrying data are mapped, not thrown raw", async () => {
+  for (const json of [
+    null,
+    [],
+    { result: { data_array: "x" }, status: { state: "SUCCEEDED" } },
+  ]) {
+    handler = () => ({ json });
+    assert.equal(
+      await code(sp().query({ statement: "SELECT 1" })),
+      "unavailable",
+    );
+  }
+  handler = () => ({
+    json: {
+      status: {
+        state: "FAILED",
+        error: { error_code: "RESOURCE_EXHAUSTED: ssn=123" },
+      },
+    },
+  });
+  try {
+    await sp().query({ statement: "SELECT 1" });
+    assert.fail("expected an error");
+  } catch (err) {
+    assert.ok(err instanceof DataError);
+    assert.doesNotMatch(err.message, /ssn/);
+  }
+});
+
+test("a 401 drops the cached service-principal token", async () => {
+  const s = sp();
+  handler = () => ({ status: 401 });
+  assert.equal(await code(s.query({ statement: "SELECT 1" })), "unavailable");
+  handler = () => ok([["1"]]);
+  await s.query({ statement: "SELECT 1" });
+  assert.equal(seen.filter((x) => x.path === "/oidc/v1/token").length, 2);
 });
