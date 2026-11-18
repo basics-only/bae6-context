@@ -255,9 +255,7 @@ class DataClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def sources(
-        self, *, end_user_token: str | None = None
-    ) -> dict[str, Any]:
+    async def sources(self, *, end_user_token: str | None = None) -> dict[str, Any]:
         """`unavailable`: IDs of sources that could not be opened just now."""
         body = await self._http.request(
             "GET", "/v1/sources", headers=_headers(end_user_token)
