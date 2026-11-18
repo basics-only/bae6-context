@@ -119,6 +119,18 @@ importers:
         specifier: 5.9.3
         version: 5.9.3
 
+  packages/mcp:
+    devDependencies:
+      '@types/node':
+        specifier: 22.18.10
+        version: 22.18.10
+      tsx:
+        specifier: 4.20.6
+        version: 4.20.6
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
   sdk/typescript:
     devDependencies:
       '@types/node':
