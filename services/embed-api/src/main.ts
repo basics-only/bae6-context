@@ -56,7 +56,7 @@ const config = parseConfig(JSON.parse(rawConfig));
 
 const aiUrl = required("BAE6_AI_URL");
 const aiTokenFile = env.BAE6_AI_TOKEN_FILE;
-const aiToken = env.BAE6_AI_TOKEN;
+const aiToken = env.BAE6_AI_TOKEN?.trim();
 if (!aiTokenFile === !aiToken) {
   throw new Error("set exactly one of BAE6_AI_TOKEN_FILE or BAE6_AI_TOKEN");
 }

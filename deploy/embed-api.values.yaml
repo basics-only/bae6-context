@@ -30,7 +30,8 @@ env:
     "source":{"region":"us-east-1","bucket":"replace-with-bucket","prefix":"example/"},
     "acl":[{"prefix":"","principals":["user:replace-with-subject"]}]}]}
 
-# Secrets are named here and read from the environment; never inline them.
+# Secrets are named here and read from the environment; never inline them. They are read once
+# at start, so rotating one needs a rollout.
 envFromSecrets:
   - name: BAE6_EMBED_DATABASE_URL
     secret: bae6-context-embed-api
@@ -59,7 +60,17 @@ networkPolicy:
       ports:
         - port: 5432
         - port: 443
-        - port: 80
+    # bae6-ai: the Service's port 80 is translated to the pod's port 8080 before this applies.
+    # bae6-ai's own ingress policy must admit this release.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: bae6
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: bae6-ai
+      ports:
+        - port: 8080
     # EKS Pod Identity agent.
     - to:
         - ipBlock:
