@@ -1,0 +1,60 @@
+# bae6-context data API on the bae6-platform `bae6-service` chart. It is stateless; each
+# source's database or store is external and owned by its organization.
+# helm install bae6-context-data-api <bae6-platform checkout>/charts/bae6-service \
+#   -f deploy/data-api.values.yaml --set image.digest=sha256:...
+image:
+  repository: ghcr.io/basics-only/bae6-context-data-api
+
+replicas: 2
+autoscaling:
+  minReplicas: 2
+  # Postgres sources: poolMax x maxReplicas must fit each database's connection share.
+  maxReplicas: 6
+
+# Drain delay + the longest source call (60 s Postgres default) + margin.
+terminationGracePeriodSeconds: 80
+
+env:
+  BAE6_SHUTDOWN_DELAY_MS: "10000"
+  # Memory: every in-flight request can buffer one result (16 MiB default limits).
+  BAE6_MAX_INFLIGHT: "16"
+  BAE6_MAX_INFLIGHT_PER_ORGANIZATION: "8"
+  BAE6_DATA_ISSUERS: >-
+    [{"issuer":"https://idp.example.invalid/","audience":"bae6-context-data","jwksUri":"https://idp.example.invalid/.well-known/jwks.json","organization":"example","application":"example-app"}]
+  # Secrets are named here and read from the environment; never inline them.
+  BAE6_DATA_CONFIG: >-
+    {"sources":[
+    {"id":"crm","organization":"example","kind":"postgres","connectionStringEnv":"BAE6_SOURCE_CRM_URL","poolMax":4},
+    {"id":"docs","organization":"example","kind":"s3","region":"us-east-1","bucket":"replace-with-bucket","prefix":"example/"}]}
+
+envFromSecrets:
+  - name: BAE6_SOURCE_CRM_URL
+    secret: bae6-context-data-api
+    key: crm-url
+
+serviceAccount:
+  # S3 via EKS Pod Identity needs no annotation.
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+networkPolicy:
+  egress:
+    # Source databases, Databricks, S3 and the identity provider's JWKS; narrow per source.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 5432
+        - port: 443
+    # EKS Pod Identity agent.
+    - to:
+        - ipBlock:
+            cidr: 169.254.170.23/32
+      ports:
+        - port: 80
