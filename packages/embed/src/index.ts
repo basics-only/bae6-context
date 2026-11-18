@@ -1,11 +1,19 @@
 export { type Chunk, type ChunkOptions, chunkText } from "./chunk.js";
 export {
   type AclResolver,
+  type Deps,
   ingestObject,
   prefixAcl,
   type SyncResult,
   syncCollection,
 } from "./pipeline.js";
+export {
+  type Job,
+  type JobQueue,
+  type JobState,
+  Worker,
+  type WorkerOptions,
+} from "./worker.js";
 
 export interface EmbeddingModel {
   readonly id: string;
