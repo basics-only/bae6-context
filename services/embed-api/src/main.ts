@@ -55,7 +55,11 @@ if (!rawConfig) {
 const config = parseConfig(JSON.parse(rawConfig));
 
 const aiUrl = required("BAE6_AI_URL");
-const aiTokenFile = required("BAE6_AI_TOKEN_FILE");
+const aiTokenFile = env.BAE6_AI_TOKEN_FILE;
+const aiToken = env.BAE6_AI_TOKEN;
+if (!aiTokenFile === !aiToken) {
+  throw new Error("set exactly one of BAE6_AI_TOKEN_FILE or BAE6_AI_TOKEN");
+}
 const port = int("PORT", 8080, 1, 65535);
 const maxInflight = int("BAE6_MAX_INFLIGHT", 16, 1, 10_000);
 const maxInflightPerOrganization = int(
@@ -86,7 +90,8 @@ await PgVectorIndex.migrate(pool);
 const index = new PgVectorIndex(pool);
 const queue = new PgJobQueue(pool);
 
-const token = async () => (await readFile(aiTokenFile, "utf8")).trim();
+const token = async () =>
+  aiToken ?? (await readFile(aiTokenFile as string, "utf8")).trim();
 const aws = awsCredentials(env);
 const models = new Map<string, BoundCollection["model"]>();
 const key = (org: string, id: string) => `${org}/${id}`;
