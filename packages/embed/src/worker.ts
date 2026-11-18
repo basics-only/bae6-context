@@ -11,30 +11,35 @@ export interface Job {
   attempts: number;
   result?: SyncResult;
   errorCode?: string;
+  /** Present on a claimed job: a token unique to this claim, presented on every later call. */
+  lease?: string;
+  leaseMs?: number;
 }
 
-/** Every transition names the owner, so a worker that lost its lease cannot change a job it no longer holds. */
+/** Every transition presents the claim's lease token, so a worker that lost its lease cannot change the job. */
 export interface JobQueue {
   /** One queued job per (collection, prefix): enqueueing again returns the waiting one. */
   enqueue(scope: Scope, prefix: string): Promise<Job>;
   /** Tenant-scoped: another tenant's job is `undefined`. */
   get(scope: Scope, id: string): Promise<Job | undefined>;
   claim(owner: string): Promise<Job | undefined>;
-  heartbeat(id: string, owner: string): Promise<boolean>;
-  succeed(id: string, owner: string, result: SyncResult): Promise<boolean>;
+  heartbeat(id: string, lease: string): Promise<boolean>;
+  succeed(id: string, lease: string, result: SyncResult): Promise<boolean>;
   fail(
     id: string,
-    owner: string,
+    lease: string,
     code: string,
     retryable: boolean,
   ): Promise<boolean>;
-  release(id: string, owner: string): Promise<void>;
+  release(id: string, lease: string): Promise<void>;
 }
 
 export interface WorkerOptions {
   owner: string;
   /** The collection's source, model, index and ACL for this job's tenant. */
   resolve(job: Job, signal: AbortSignal): Promise<Deps>;
+  /** Queue outages land here; the loop backs off and carries on. */
+  onError(err: unknown): void;
   heartbeatMs?: number;
   pollMs?: number;
   maxObjects?: number;
@@ -66,43 +71,64 @@ export class Worker {
     const { owner, heartbeatMs = 15_000, maxObjects } = this.opts;
     const job = await this.queue.claim(owner);
     if (!job) return false;
+    const lease = job.lease;
+    if (!lease || !job.leaseMs) throw new Error("claim returned no lease");
+    if (signal.aborted) {
+      await this.queue.release(job.id, lease);
+      return true;
+    }
+
     const run = new AbortController();
     const stop = () => run.abort();
     signal.addEventListener("abort", stop, { once: true });
     let lostLease = false;
+    const lose = () => {
+      lostLease = true;
+      run.abort();
+    };
+    // The lease is only trusted until the deadline; a stalled heartbeat cannot extend it.
+    let deadline = Date.now() + job.leaseMs;
+    let beating = false;
     const beat = setInterval(() => {
-      this.queue.heartbeat(job.id, owner).then(
-        (held) => {
-          if (!held) {
-            lostLease = true;
-            run.abort();
-          }
-        },
-        () => {
-          lostLease = true;
-          run.abort();
-        },
-      );
+      if (Date.now() >= deadline) return lose();
+      if (beating) return;
+      beating = true;
+      const started = Date.now();
+      this.queue
+        .heartbeat(job.id, lease)
+        .then((held) => {
+          if (held) deadline = started + (job.leaseMs ?? 0);
+          else lose();
+        }, lose)
+        .finally(() => {
+          beating = false;
+        });
     }, heartbeatMs);
+
+    let result: SyncResult | undefined;
+    let failure: unknown;
     try {
       const deps = await this.opts.resolve(job, run.signal);
-      const result = await syncCollection(deps, job.scope, {
+      result = await syncCollection(deps, job.scope, {
         prefix: job.prefix,
         signal: run.signal,
         ...(maxObjects ? { maxObjects } : {}),
       });
-      await this.queue.succeed(job.id, owner, result);
     } catch (err) {
-      if (lostLease) return true;
-      if (signal.aborted) {
-        await this.queue.release(job.id, owner);
-        return true;
-      }
-      const code = err instanceof EmbedError ? err.code : "internal";
-      await this.queue.fail(job.id, owner, code, !PERMANENT.has(code));
+      failure = err;
     } finally {
       clearInterval(beat);
       signal.removeEventListener("abort", stop);
+    }
+
+    if (lostLease) return true;
+    if (result) {
+      await this.queue.succeed(job.id, lease, result);
+    } else if (signal.aborted) {
+      await this.queue.release(job.id, lease);
+    } else {
+      const code = failure instanceof EmbedError ? failure.code : "internal";
+      await this.queue.fail(job.id, lease, code, !PERMANENT.has(code));
     }
     return true;
   }
@@ -111,7 +137,12 @@ export class Worker {
   async run(signal: AbortSignal) {
     const { pollMs = 1000 } = this.opts;
     while (!signal.aborted) {
-      if (!(await this.runOnce(signal))) await pause(pollMs, signal);
+      try {
+        if (await this.runOnce(signal)) continue;
+      } catch (err) {
+        this.opts.onError(err);
+      }
+      await pause(pollMs, signal);
     }
   }
 }

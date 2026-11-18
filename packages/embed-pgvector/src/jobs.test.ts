@@ -64,8 +64,8 @@ test("only the lease holder can finish a job", { skip }, async () => {
   const job = await q.claim("w1");
   assert.equal(job?.state, "running");
   assert.equal(await q.claim("w2"), undefined);
-  assert.equal(await q.succeed(job!.id, "w2", result), false);
-  assert.equal(await q.succeed(job!.id, "w1", result), true);
+  assert.equal(await q.succeed(job!.id, "w1", result), false);
+  assert.equal(await q.succeed(job!.id, job!.lease!, result), true);
   assert.deepEqual((await q.get(scope, job!.id))?.result, result);
 });
 
@@ -98,8 +98,18 @@ test("a tenant runs at most its concurrency limit", { skip }, async () => {
   const first = await q.claim("w1");
   assert.ok(await q.claim("w2"));
   assert.equal(await q.claim("w3"), undefined);
-  await q.succeed(first!.id, "w1", result);
+  await q.succeed(first!.id, first!.lease!, result);
   assert.ok(await q.claim("w3"));
+});
+
+test("a tenant at its limit does not starve the others", { skip }, async () => {
+  const q = queue({ maxRunningPerTenant: 1 });
+  const busy = `org-${randomUUID()}`;
+  for (let i = 0; i < 7; i++) await q.enqueue(await collection(busy), "");
+  assert.ok(await q.claim("w1"));
+  const other = await collection();
+  const waiting = await q.enqueue(other, "");
+  assert.equal((await q.claim("w2"))?.id, waiting.id);
 });
 
 test(
@@ -111,11 +121,13 @@ test(
     await q.enqueue(scope, "");
     const first = await q.claim("w1");
     await sleep(120);
-    assert.equal(await q.heartbeat(first!.id, "w1"), false);
-    const second = await q.claim("w2");
+    assert.equal(await q.heartbeat(first!.id, first!.lease!), false);
+    const second = await q.claim("w1");
     assert.equal(second?.id, first!.id);
     assert.equal(second?.attempts, 2);
-    assert.equal(await q.succeed(first!.id, "w1", result), false);
+    assert.equal(await q.heartbeat(first!.id, first!.lease!), false);
+    assert.equal(await q.succeed(first!.id, first!.lease!, result), false);
+    assert.equal(await q.succeed(second!.id, second!.lease!, result), true);
   },
 );
 
@@ -139,15 +151,15 @@ test(
     const q = queue();
     const scope = await collection();
     const job = await q.enqueue(scope, "");
-    await q.claim("w1");
-    assert.equal(await q.fail(job.id, "w1", "model_error", true), true);
+    const run = await q.claim("w1");
+    assert.equal(await q.fail(job.id, run!.lease!, "model_error", true), true);
     assert.equal((await q.get(scope, job.id))?.state, "queued");
     assert.equal(await q.claim("w2"), undefined);
 
     const other = await collection();
     const bad = await q.enqueue(other, "");
-    await q.claim("w1");
-    await q.fail(bad.id, "w1", "invalid_request", false);
+    const badRun = await q.claim("w1");
+    await q.fail(bad.id, badRun!.lease!, "invalid_request", false);
     const failed = await q.get(other, bad.id);
     assert.deepEqual(
       [failed?.state, failed?.errorCode],
@@ -164,7 +176,7 @@ test(
     const scope = await collection();
     await q.enqueue(scope, "");
     const first = await q.claim("w1");
-    await q.release(first!.id, "w1");
+    await q.release(first!.id, first!.lease!);
     const again = await q.claim("w2");
     assert.equal(again?.id, first!.id);
     assert.equal(again?.attempts, 1);
@@ -177,4 +189,5 @@ test("a tenant cannot queue without bound", { skip }, async () => {
   await q.enqueue(scope, "a/");
   await q.enqueue(scope, "b/");
   await assert.rejects(q.enqueue(scope, "c/"), { code: "too_large" });
+  assert.equal((await q.enqueue(scope, "a/")).prefix, "a/");
 });

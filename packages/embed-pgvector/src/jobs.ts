@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   EmbedError,
   type Job,
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_queued
   ON jobs (organization_id, collection_id, prefix) WHERE state = 'queued';
 CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs (state, run_after);
+CREATE INDEX IF NOT EXISTS jobs_by_collection ON jobs (organization_id, collection_id);
 `;
 
 export const MAX_PREFIX_LENGTH = 1024;
@@ -57,6 +59,7 @@ const toJob = (r: Record<string, unknown>): Job => ({
   attempts: r.attempts as number,
   ...(r.result ? { result: r.result as SyncResult } : {}),
   ...(r.error_code ? { errorCode: r.error_code as string } : {}),
+  ...(r.state === "running" ? { lease: r.lease_owner as string } : {}),
 });
 
 const lockTenant = (client: PoolClient, organizationId: string) =>
@@ -89,45 +92,52 @@ export class PgJobQueue implements JobQueue {
         `prefix is at most ${MAX_PREFIX_LENGTH} characters.`,
       );
     }
-    return inTransaction(this.pool, async (client) => {
-      await lockTenant(client, scope.organizationId);
-      const known = await client.query(
-        `SELECT 1 FROM collections WHERE organization_id = $1 AND collection_id = $2`,
-        [scope.organizationId, scope.collectionId],
-      );
-      if (known.rowCount === 0) {
-        throw new EmbedError("invalid_request", "unknown collection.");
-      }
-      await client.query(
-        `DELETE FROM jobs WHERE organization_id = $1
+    return inTransaction(
+      this.pool,
+      async (client) => {
+        await lockTenant(client, scope.organizationId);
+        const known = await client.query(
+          `SELECT 1 FROM collections WHERE organization_id = $1 AND collection_id = $2`,
+          [scope.organizationId, scope.collectionId],
+        );
+        if (known.rowCount === 0) {
+          throw new EmbedError("invalid_request", "unknown collection.");
+        }
+        await client.query(
+          `DELETE FROM jobs WHERE organization_id = $1
            AND state IN ('succeeded', 'failed')
            AND created_at < clock_timestamp() - $2::interval`,
-        [scope.organizationId, FINISHED_RETENTION],
-      );
-      const active = await client.query(
-        `SELECT count(*)::int AS n FROM jobs
+          [scope.organizationId, FINISHED_RETENTION],
+        );
+        const active = await client.query(
+          `SELECT count(*)::int AS n FROM jobs
          WHERE organization_id = $1 AND state IN ('queued', 'running')`,
-        [scope.organizationId],
-      );
-      const { rows } = await client.query(
-        `INSERT INTO jobs (organization_id, collection_id, prefix, state)
-         SELECT $1, $2, $3, 'queued' WHERE $4::int < $5
+          [scope.organizationId],
+        );
+        const { rows } = await client.query(
+          `INSERT INTO jobs (organization_id, collection_id, prefix, state)
+         SELECT $1, $2, $3, 'queued'
+         WHERE $4::int < $5 OR EXISTS (
+           SELECT 1 FROM jobs WHERE organization_id = $1 AND collection_id = $2
+             AND prefix = $3 AND state = 'queued')
          ON CONFLICT (organization_id, collection_id, prefix) WHERE state = 'queued'
          DO UPDATE SET prefix = jobs.prefix
          RETURNING *`,
-        [
-          scope.organizationId,
-          scope.collectionId,
-          prefix,
-          active.rows[0].n,
-          this.maxActive,
-        ],
-      );
-      if (rows.length === 0) {
-        throw new EmbedError("too_large", "too many jobs are waiting.");
-      }
-      return toJob(rows[0]);
-    });
+          [
+            scope.organizationId,
+            scope.collectionId,
+            prefix,
+            active.rows[0].n,
+            this.maxActive,
+          ],
+        );
+        if (rows.length === 0) {
+          throw new EmbedError("too_large", "too many jobs are waiting.");
+        }
+        return toJob(rows[0]);
+      },
+      { timeoutMs: 10_000 },
+    );
   }
 
   async get(scope: Scope, id: string): Promise<Job | undefined> {
@@ -153,11 +163,16 @@ export class PgJobQueue implements JobQueue {
         );
         const candidates = await client.query(
           `SELECT job_id, organization_id FROM jobs
-           WHERE (state = 'queued' AND run_after <= clock_timestamp())
-              OR (state = 'running' AND lease_expires_at < clock_timestamp())
+           WHERE ((state = 'queued' AND run_after <= clock_timestamp())
+              OR (state = 'running' AND lease_expires_at < clock_timestamp()))
+             AND (SELECT count(*) FROM jobs r
+                  WHERE r.organization_id = jobs.organization_id
+                    AND r.state = 'running'
+                    AND r.lease_expires_at >= clock_timestamp()) < $1
            ORDER BY created_at
            LIMIT ${CLAIM_CANDIDATES}
            FOR UPDATE SKIP LOCKED`,
+          [this.maxRunning],
         );
         for (const c of candidates.rows) {
           // A tenant whose lock is held is busy being claimed or enqueued: skip it, never wait.
@@ -179,9 +194,9 @@ export class PgJobQueue implements JobQueue {
                              lease_expires_at = clock_timestamp() + $3 * interval '1 millisecond'
              WHERE job_id = $1
              RETURNING *`,
-            [c.job_id, owner, this.leaseMs],
+            [c.job_id, `${owner}:${randomUUID()}`, this.leaseMs],
           );
-          return toJob(rows[0]);
+          return { ...toJob(rows[0]), leaseMs: this.leaseMs };
         }
         return undefined;
       },
@@ -227,43 +242,47 @@ export class PgJobQueue implements JobQueue {
     retryable: boolean,
     refund: boolean,
   ) {
-    return inTransaction(this.pool, async (client) => {
-      const lock = await client.query(
-        `SELECT pg_advisory_xact_lock($1, hashtext(organization_id))
+    return inTransaction(
+      this.pool,
+      async (client) => {
+        const lock = await client.query(
+          `SELECT pg_advisory_xact_lock($1, hashtext(organization_id))
          FROM jobs WHERE job_id = $2`,
-        [LOCK_NAMESPACE, id],
-      );
-      if (lock.rowCount === 0) return false;
-      const cur = await client.query(
-        `SELECT attempts,
+          [LOCK_NAMESPACE, id],
+        );
+        if (lock.rowCount === 0) return false;
+        const cur = await client.query(
+          `SELECT attempts,
                 EXISTS (SELECT 1 FROM jobs q
                         WHERE q.organization_id = j.organization_id
                           AND q.collection_id = j.collection_id
                           AND q.prefix = j.prefix AND q.state = 'queued') AS covered
          FROM jobs j
          WHERE job_id = $1 AND lease_owner = $2 AND state = 'running'`,
-        [id, owner],
-      );
-      if (cur.rowCount === 0) return false;
-      const attempts = cur.rows[0].attempts - (refund ? 1 : 0);
-      // A job already waiting for the same prefix covers this one.
-      const requeue =
-        retryable && attempts < this.maxAttempts && !cur.rows[0].covered;
-      await client.query(
-        `UPDATE jobs SET state = $3, attempts = $4,
+          [id, owner],
+        );
+        if (cur.rowCount === 0) return false;
+        const attempts = cur.rows[0].attempts - (refund ? 1 : 0);
+        // A job already waiting for the same prefix covers this one.
+        const requeue =
+          retryable && attempts < this.maxAttempts && !cur.rows[0].covered;
+        await client.query(
+          `UPDATE jobs SET state = $3, attempts = $4,
                 run_after = clock_timestamp() + $5 * interval '1 second',
                 error_code = $6, lease_owner = NULL, lease_expires_at = NULL
          WHERE job_id = $1 AND lease_owner = $2`,
-        [
-          id,
-          owner,
-          requeue ? "queued" : "failed",
-          attempts,
-          refund ? 0 : Math.min(2 ** attempts, 60),
-          requeue ? code : (code ?? "superseded"),
-        ],
-      );
-      return true;
-    });
+          [
+            id,
+            owner,
+            requeue ? "queued" : "failed",
+            attempts,
+            refund ? 0 : Math.min(2 ** attempts, 60),
+            requeue ? code : (code ?? "superseded"),
+          ],
+        );
+        return true;
+      },
+      { timeoutMs: 10_000 },
+    );
   }
 }
