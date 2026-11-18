@@ -43,6 +43,7 @@ export interface Version extends VersionInput {
   state: State;
   scanStatus: ScanStatus;
   publishedBy: string;
+  publishedVia: string;
   publishedAt: string;
   decidedBy?: string;
   decidedAt?: string;
@@ -96,6 +97,8 @@ export interface AuditEvent {
 export interface Caller {
   /** Who is accountable: the user when one is delegated, else the workload. */
   subject: string;
+  /** The calling workload, whether or not a user is delegated. */
+  workload: string;
   /** For the audit trail: `<workload> for <user>` when delegated. */
   actor: string;
   requestId: string;

@@ -8,11 +8,23 @@ import {
   RegistryError,
 } from "./index.js";
 
-const alice: Caller = { subject: "alice", actor: "alice", requestId: "r1" };
+const alice: Caller = {
+  subject: "alice",
+  workload: "alice",
+  actor: "alice",
+  requestId: "r1",
+};
 const bob: Caller = {
   subject: "bob",
+  workload: "svc",
   actor: "svc for bob",
   requestId: "r2",
+};
+const svc: Caller = {
+  subject: "svc",
+  workload: "svc",
+  actor: "svc",
+  requestId: "r3",
 };
 
 const version = (over: Record<string, unknown> = {}) => ({
@@ -79,6 +91,22 @@ test("a publisher cannot approve their own version", async () => {
     registry.approve("acme", "docs", { version: "1.0.0" }, alice),
     code("forbidden"),
   );
+});
+
+test("a workload cannot approve what it published for a user", async () => {
+  const { registry } = setup();
+  await registry.createServer("acme", server(), bob);
+  await assert.rejects(
+    registry.approve("acme", "docs", { version: "1.0.0" }, svc),
+    code("forbidden"),
+  );
+});
+
+test("one workload may approve a version another user published through it", async () => {
+  const { registry } = setup();
+  const carol: Caller = { ...bob, subject: "carol", actor: "svc for carol" };
+  await registry.createServer("acme", server(), bob);
+  await registry.approve("acme", "docs", { version: "1.0.0" }, carol);
 });
 
 test("another organization sees neither the server nor its name in listings", async () => {

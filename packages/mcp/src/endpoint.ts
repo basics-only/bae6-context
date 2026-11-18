@@ -79,7 +79,7 @@ export function checkEndpoint(raw: unknown, policy: EgressPolicy = {}): string {
   if (u.search !== "" || u.hash !== "") {
     bad("endpoint must not have a query or fragment");
   }
-  const host = u.hostname.replace(/\.$/, "");
+  const host = u.hostname.replace(/\.+$/, "");
   if (!insecure) {
     if (isIP(host.replace(/^\[|\]$/g, "")) !== 0) {
       bad("endpoint must name a host, not an address");

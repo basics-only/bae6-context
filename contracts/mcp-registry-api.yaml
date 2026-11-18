@@ -448,7 +448,7 @@ components:
       allOf:
         - $ref: "#/components/schemas/VersionBody"
         - type: object
-          required: [state, scanStatus, publishedBy, publishedAt]
+          required: [state, scanStatus, publishedBy, publishedVia, publishedAt]
           properties:
             state:
               type: string
@@ -457,6 +457,8 @@ components:
               type: string
               enum: [unscanned, clean]
             publishedBy:
+              type: string
+            publishedVia:
               type: string
             publishedAt:
               type: string

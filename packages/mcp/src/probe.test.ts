@@ -45,6 +45,7 @@ const versionAt = (origin: string, oauth = false): Version => ({
   state: "approved",
   scanStatus: "unscanned",
   publishedBy: "alice",
+  publishedVia: "alice",
   publishedAt: "2026-11-18T10:00:00Z",
 });
 

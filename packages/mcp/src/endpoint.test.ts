@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import type { LookupAddress } from "node:dns";
 import { test } from "node:test";
-import { guardedLookup, isPublicAddress, type Resolver } from "./index.js";
+import {
+  checkEndpoint,
+  guardedLookup,
+  isPublicAddress,
+  type Resolver,
+} from "./index.js";
 
 test("classifies addresses as public or not", () => {
   const nonPublic = [
@@ -55,6 +60,12 @@ const lookup = (
   new Promise((done) =>
     fn("mcp.example.com", { all }, (err, address) => done({ err, address })),
   );
+
+test("hosts that end in several dots are still judged by their name", () => {
+  for (const host of ["localhost..", "x.localhost..", "intranet.."]) {
+    assert.throws(() => checkEndpoint(`https://${host}/`, {}), /./, host);
+  }
+});
 
 test("a name resolving to any private address is refused", async () => {
   for (const found of [

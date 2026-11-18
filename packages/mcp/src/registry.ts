@@ -58,6 +58,7 @@ export class Registry {
       state: "pending",
       scanStatus: "unscanned",
       publishedBy: who.subject,
+      publishedVia: who.workload,
       publishedAt: this.now().toISOString(),
     };
   }
@@ -156,7 +157,12 @@ export class Registry {
           "a revoked version cannot be approved",
         );
       }
-      if (target.publishedBy === who.subject) {
+      // One workload acting without a delegated user on either side is one actor.
+      const sameWorkload =
+        target.publishedVia === who.workload &&
+        (target.publishedBy === target.publishedVia ||
+          who.subject === who.workload);
+      if (target.publishedBy === who.subject || sameWorkload) {
         throw new RegistryError(
           "forbidden",
           "a version cannot be approved by its publisher",
