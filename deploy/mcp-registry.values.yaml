@@ -1,0 +1,53 @@
+# bae6-context MCP registry on the bae6-platform `bae6-service` chart. Replicas are
+# interchangeable; all state lives in the Postgres database it owns.
+# helm install bae6-context-mcp-registry <bae6-platform checkout>/charts/bae6-service \
+#   -f deploy/mcp-registry.values.yaml --set image.digest=sha256:...
+image:
+  repository: ghcr.io/basics-only/bae6-context-mcp-registry
+
+replicas: 2
+autoscaling:
+  minReplicas: 2
+  # BAE6_MCP_DB_POOL_MAX x maxReplicas must fit the database's connection share.
+  maxReplicas: 6
+
+# Drain delay (10 s) + main.ts hard exit (BAE6_REQUEST_TIMEOUT_MS 30 s + 5 s) + margin, so
+# main.ts, not SIGKILL, ends shutdown.
+terminationGracePeriodSeconds: 60
+
+env:
+  BAE6_SHUTDOWN_DELAY_MS: "10000"
+  BAE6_MAX_INFLIGHT: "32"
+  BAE6_MAX_INFLIGHT_PER_ORGANIZATION: "16"
+  BAE6_MCP_DB_POOL_MAX: "10"
+  # Health probes may only reach hosts under these suffixes. Unset, any public https host
+  # is allowed: set it before exposing the registry to publishers you do not control.
+  # Comma-separated domains, no leading dot: example.com allows example.com and *.example.com.
+  BAE6_MCP_ALLOWED_HOST_SUFFIXES: example.invalid
+  BAE6_MCP_ISSUERS: >-
+    [{"issuer":"https://idp.example.invalid/","audience":"bae6-context-mcp","jwksUri":"https://idp.example.invalid/.well-known/jwks.json","organization":"example","application":"example-app"}]
+
+# Secrets are named here and read from the environment; never inline them. They are read once
+# at start, so rotating one needs a rollout.
+envFromSecrets:
+  - name: BAE6_MCP_DATABASE_URL
+    secret: bae6-context-mcp-registry
+    key: database-url
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+networkPolicy:
+  egress:
+    # Postgres, the identity provider's JWKS and the registered servers' health endpoints;
+    # narrow per target.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 5432
+        - port: 443
