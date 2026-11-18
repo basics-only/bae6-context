@@ -1,0 +1,79 @@
+# bae6-context embed API on the bae6-platform `bae6-service` chart. Every replica serves
+# requests and runs sync workers; state lives in the pgvector database it owns (ADR-0007).
+# helm install bae6-context-embed-api <bae6-platform checkout>/charts/bae6-service \
+#   -f deploy/embed-api.values.yaml --set image.digest=sha256:...
+image:
+  repository: ghcr.io/basics-only/bae6-context-embed-api
+
+replicas: 2
+autoscaling:
+  minReplicas: 2
+  # BAE6_EMBED_DB_POOL_MAX x maxReplicas must fit the database's connection share.
+  maxReplicas: 6
+
+# Drain delay (10 s) + main.ts hard exit (BAE6_REQUEST_TIMEOUT_MS 30 s + 5 s) + margin, so
+# main.ts, not SIGKILL, ends shutdown. A sync in flight is handed back for another replica.
+terminationGracePeriodSeconds: 60
+
+env:
+  BAE6_SHUTDOWN_DELAY_MS: "10000"
+  BAE6_MAX_INFLIGHT: "16"
+  BAE6_MAX_INFLIGHT_PER_ORGANIZATION: "8"
+  BAE6_EMBED_WORKERS: "1"
+  BAE6_EMBED_DB_POOL_MAX: "10"
+  BAE6_AI_URL: http://bae6-ai.bae6.svc.cluster.local
+  BAE6_EMBED_ISSUERS: >-
+    [{"issuer":"https://idp.example.invalid/","audience":"bae6-context-embed","jwksUri":"https://idp.example.invalid/.well-known/jwks.json","organization":"example","application":"example-app"}]
+  BAE6_EMBED_CONFIG: >-
+    {"collections":[
+    {"id":"kb","organization":"example","model":{"id":"replace-with-model","dimensions":1024},
+    "source":{"region":"us-east-1","bucket":"replace-with-bucket","prefix":"example/"},
+    "acl":[{"prefix":"","principals":["user:replace-with-subject"]}]}]}
+
+# Secrets are named here and read from the environment; never inline them. They are read once
+# at start, so rotating one needs a rollout.
+envFromSecrets:
+  - name: BAE6_EMBED_DATABASE_URL
+    secret: bae6-context-embed-api
+    key: database-url
+  - name: BAE6_AI_TOKEN
+    secret: bae6-context-embed-api
+    key: ai-token
+
+serviceAccount:
+  # S3 via EKS Pod Identity needs no annotation.
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+networkPolicy:
+  egress:
+    # pgvector Postgres, bae6-ai, S3 and the identity provider's JWKS; narrow per target.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 5432
+        - port: 443
+    # bae6-ai: the Service's port 80 is translated to the pod's port 8080 before this applies.
+    # bae6-ai's own ingress policy must admit this release.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: bae6
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: bae6-ai
+      ports:
+        - port: 8080
+    # EKS Pod Identity agent.
+    - to:
+        - ipBlock:
+            cidr: 169.254.170.23/32
+      ports:
+        - port: 80
