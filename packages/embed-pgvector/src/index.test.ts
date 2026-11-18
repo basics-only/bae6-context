@@ -20,10 +20,12 @@ const doc = (
   principals: string[],
   vectors: number[][],
   revision = "r1",
+  aclSyncedAt = Date.now(),
 ): IndexedDocument => ({
   key,
   revision,
   principals,
+  aclSyncedAt,
   chunks: vectors.map((vector, i) => ({
     id: `${key}#${revision}#${i}`,
     ordinal: i,
@@ -96,7 +98,7 @@ test("a revoked principal no longer finds the document", { skip }, async () => {
   const scope = await fresh();
   await index.upsert(scope, doc("a.txt", ["user:alice"], [[1, 0]]));
   assert.equal((await index.search(scope, q(["user:alice"]))).length, 1);
-  await index.refreshAcl(scope, "a.txt", ["user:bob"]);
+  await index.refreshAcl(scope, "a.txt", ["user:bob"], Date.now());
   assert.deepEqual(await index.search(scope, q(["user:alice"])), []);
   assert.equal((await index.search(scope, q(["user:bob"]))).length, 1);
 });
@@ -106,15 +108,18 @@ test(
   { skip },
   async () => {
     const scope = await fresh();
-    await index.upsert(scope, doc("a.txt", ["user:alice"], [[1, 0]]));
-    await new Promise((ok) => setTimeout(ok, 30));
+    const old = Date.now() - 5000;
+    await index.upsert(
+      scope,
+      doc("a.txt", ["user:alice"], [[1, 0]], "r1", old),
+    );
     assert.deepEqual(
-      await index.search(scope, q(["user:alice"], { maxAclAgeMs: 10 })),
+      await index.search(scope, q(["user:alice"], { maxAclAgeMs: 1000 })),
       [],
     );
-    await index.refreshAcl(scope, "a.txt", ["user:alice"]);
+    await index.refreshAcl(scope, "a.txt", ["user:alice"], Date.now());
     assert.equal(
-      (await index.search(scope, q(["user:alice"], { maxAclAgeMs: 10_000 })))
+      (await index.search(scope, q(["user:alice"], { maxAclAgeMs: 1000 })))
         .length,
       1,
     );
@@ -159,17 +164,73 @@ test(
       hits.map((h) => h.revision),
       ["r2"],
     );
-    await assert.rejects(
-      index.upsert(scope, doc("a.txt", ["user:alice"], [[1, 0], [1]], "r3")),
-      { code: "invalid_request" },
+    // Fails after the document row and chunk delete have run: the duplicate chunk id.
+    const broken = doc(
+      "a.txt",
+      ["user:bob"],
+      [
+        [1, 0],
+        [0, 1],
+      ],
+      "r3",
     );
+    broken.chunks[1]!.id = broken.chunks[0]!.id;
+    await assert.rejects(index.upsert(scope, broken));
     hits = await index.search(scope, q(["user:alice"]));
     assert.deepEqual(
       hits.map((h) => h.revision),
       ["r2"],
     );
+    assert.deepEqual(await index.search(scope, q(["user:bob"])), []);
   },
 );
+
+test("a stale write cannot undo a revocation", { skip }, async () => {
+  const scope = await fresh();
+  const readAt = Date.now() - 100;
+  await index.refreshAcl(scope, "none.txt", ["user:x"], readAt);
+  await index.upsert(
+    scope,
+    doc("a.txt", ["user:alice"], [[1, 0]], "r1", readAt),
+  );
+  await index.refreshAcl(scope, "a.txt", ["user:bob"], Date.now());
+  await index.upsert(
+    scope,
+    doc("a.txt", ["user:alice"], [[1, 0]], "r2", readAt + 1),
+  );
+  assert.deepEqual(await index.search(scope, q(["user:alice"])), []);
+  const hits = await index.search(scope, q(["user:bob"]));
+  assert.deepEqual(
+    hits.map((h) => h.revision),
+    ["r1"],
+  );
+});
+
+test(
+  "the same key and chunk ids in two tenants stay separate",
+  { skip },
+  async () => {
+    const a = await fresh();
+    const b = await fresh();
+    await index.upsert(a, doc("a.txt", ["user:alice"], [[1, 0]]));
+    await index.upsert(b, doc("a.txt", ["user:alice"], [[1, 0]]));
+    await index.remove(a, "a.txt");
+    assert.deepEqual(await index.search(a, q(["user:alice"])), []);
+    assert.equal((await index.search(b, q(["user:alice"]))).length, 1);
+    await index.refreshAcl(a, "a.txt", ["user:bob"], Date.now());
+    assert.deepEqual(await index.search(b, q(["user:bob"])), []);
+  },
+);
+
+test("two documents may reuse a chunk id", { skip }, async () => {
+  const scope = await fresh();
+  const one = doc("a.txt", ["user:alice"], [[1, 0]]);
+  const two = doc("b.txt", ["user:alice"], [[0, 1]]);
+  two.chunks[0]!.id = one.chunks[0]!.id;
+  await index.upsert(scope, one);
+  await index.upsert(scope, two);
+  assert.equal((await index.search(scope, q(["user:alice"]))).length, 2);
+});
 
 test("a collection is tied to its model and dimensions", { skip }, async () => {
   const scope = await fresh();

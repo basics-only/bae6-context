@@ -47,6 +47,7 @@ export async function ingestObject(
   scope: Scope,
   info: ObjectInfo,
   principals: string[],
+  aclSyncedAt: number,
   signal?: AbortSignal,
 ) {
   const acl = checkPrincipals(principals);
@@ -103,6 +104,7 @@ export async function ingestObject(
       key: info.key,
       revision: revisionOf(read),
       principals: acl,
+      aclSyncedAt,
       chunks: indexed,
     },
     signal,
@@ -164,6 +166,7 @@ export async function syncCollection(
     if (signal?.aborted)
       throw new EmbedError("cancelled", "the sync was cancelled.");
     // A resolver error aborts the sync: an outage must not delete what is indexed.
+    const aclSyncedAt = Date.now();
     const principals = TEXT_KEY.test(info.key)
       ? await deps.acl(info, signal)
       : [];
@@ -175,11 +178,12 @@ export async function syncCollection(
           scope,
           info.key,
           checkPrincipals(principals),
+          aclSyncedAt,
           signal,
         );
         result.refreshed++;
       } else {
-        await ingestObject(deps, scope, info, principals, signal);
+        await ingestObject(deps, scope, info, principals, aclSyncedAt, signal);
         result.ingested++;
       }
     } catch (err) {

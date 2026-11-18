@@ -241,7 +241,7 @@ test("unusable vectors and non-text objects are not indexed", async () => {
   });
   assert.equal((await index.revisions(scope, 10)).size, 0);
   await assert.rejects(
-    ingestObject(deps, scope, deps.source.info("a.txt"), []),
+    ingestObject(deps, scope, deps.source.info("a.txt"), [], 0),
     (e) => e instanceof EmbedError && e.code === "invalid_request",
   );
 });

@@ -10,6 +10,8 @@ import {
 import type { Pool, PoolClient } from "pg";
 
 export const MAX_SEARCH_LIMIT = 50;
+export const MAX_CHUNKS_PER_DOCUMENT = 500;
+export const MAX_ACL_AGE_MS = 7 * 24 * 3600 * 1000;
 const MAX_DIMENSIONS = 4096;
 const MIGRATION_LOCK = 6_201_104;
 
@@ -42,16 +44,44 @@ CREATE TABLE IF NOT EXISTS chunks (
   span_end int NOT NULL,
   body text NOT NULL,
   embedding vector NOT NULL,
-  PRIMARY KEY (organization_id, collection_id, chunk_id),
+  PRIMARY KEY (organization_id, collection_id, key, chunk_id),
   FOREIGN KEY (organization_id, collection_id, key)
     REFERENCES documents ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS chunks_by_document
-  ON chunks (organization_id, collection_id, key);
 `;
 
 const invalid = (message: string) => new EmbedError("invalid_request", message);
 const vectorLiteral = (v: number[]) => `[${v.join(",")}]`;
+
+/** The source's read time, never later than the database's clock, so a skewed worker cannot pre-date staleness. */
+const SYNCED_AT = (n: number) =>
+  `LEAST(to_timestamp($${n}::double precision / 1000.0), clock_timestamp())`;
+
+async function inTransaction<T>(
+  pool: Pool,
+  fn: (client: PoolClient) => Promise<T>,
+  { readOnly = false, timeoutMs = 0 } = {},
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query(`BEGIN${readOnly ? " READ ONLY" : ""}`);
+    if (timeoutMs > 0) {
+      await client.query(`SET LOCAL statement_timeout = ${timeoutMs | 0}`);
+    }
+    const result = await fn(client);
+    await client.query("COMMIT");
+    client.release();
+    return result;
+  } catch (err) {
+    // A connection that cannot roll back is discarded, not reused.
+    const rolledBack = await client.query("ROLLBACK").then(
+      () => true,
+      () => false,
+    );
+    client.release(rolledBack ? undefined : true);
+    throw err;
+  }
+}
 
 /**
  * Exact (sequential) nearest-neighbour search per collection. Every query is scoped to one
@@ -59,21 +89,23 @@ const vectorLiteral = (v: number[]) => `[${v.join(",")}]`;
  * overlap and whose ACL is fresh.
  */
 export class PgVectorIndex implements VectorIndex {
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    private readonly searchTimeoutMs = 10_000,
+  ) {}
 
-  /** Idempotent; concurrent runtimes serialize on an advisory lock (ADR-0007). */
+  /** Idempotent; concurrent runtimes serialize on a transaction-scoped advisory lock (ADR-0007). */
   static async migrate(pool: Pool) {
-    const client = await pool.connect();
-    try {
-      await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_LOCK]);
-      try {
+    await inTransaction(
+      pool,
+      async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock($1)", [
+          MIGRATION_LOCK,
+        ]);
         await client.query(SCHEMA);
-      } finally {
-        await client.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK]);
-      }
-    } finally {
-      client.release();
-    }
+      },
+      { timeoutMs: 60_000 },
+    );
   }
 
   /** Creates the collection, or checks it is the same model and size: a change needs a new collection. */
@@ -110,23 +142,33 @@ export class PgVectorIndex implements VectorIndex {
     return rows[0].dimensions as number;
   }
 
+  /** A write whose ACL was read before the stored one changes nothing, so it cannot undo a revocation. */
   async upsert(scope: Scope, doc: IndexedDocument, signal?: AbortSignal) {
     signal?.throwIfAborted();
     const principals = checkPrincipals(doc.principals);
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
+    if (!Number.isFinite(doc.aclSyncedAt))
+      throw invalid("aclSyncedAt is required.");
+    if (doc.chunks.length > MAX_CHUNKS_PER_DOCUMENT) {
+      throw new EmbedError(
+        "too_large",
+        `a document has at most ${MAX_CHUNKS_PER_DOCUMENT} chunks.`,
+      );
+    }
+    await inTransaction(this.pool, async (client) => {
       const dims = await this.dimensions(client, scope);
       if (doc.chunks.some((c) => c.vector.length !== dims)) {
         throw invalid("a vector does not match the collection's dimensions.");
       }
       const key = [scope.organizationId, scope.collectionId, doc.key];
-      await client.query(
-        `INSERT INTO documents VALUES ($1, $2, $3, $4, $5, now())
+      const written = await client.query(
+        `INSERT INTO documents VALUES ($1, $2, $3, $4, $5, ${SYNCED_AT(6)})
          ON CONFLICT (organization_id, collection_id, key)
-         DO UPDATE SET revision = $4, principals = $5, acl_synced_at = now()`,
-        [...key, doc.revision, principals],
+         DO UPDATE SET revision = $4, principals = $5,
+                       acl_synced_at = EXCLUDED.acl_synced_at
+         WHERE documents.acl_synced_at <= EXCLUDED.acl_synced_at`,
+        [...key, doc.revision, principals, doc.aclSyncedAt],
       );
+      if (written.rowCount === 0) return;
       await client.query(
         `DELETE FROM chunks
          WHERE organization_id = $1 AND collection_id = $2 AND key = $3`,
@@ -138,30 +180,29 @@ export class PgVectorIndex implements VectorIndex {
           [...key, c.id, c.start, c.end, c.text, vectorLiteral(c.vector)],
         );
       }
-      await client.query("COMMIT");
-    } catch (err) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async refreshAcl(
     scope: Scope,
     key: string,
     principals: string[],
+    aclSyncedAt: number,
     signal?: AbortSignal,
   ) {
     signal?.throwIfAborted();
+    if (!Number.isFinite(aclSyncedAt))
+      throw invalid("aclSyncedAt is required.");
     await this.pool.query(
-      `UPDATE documents SET principals = $4, acl_synced_at = now()
-       WHERE organization_id = $1 AND collection_id = $2 AND key = $3`,
+      `UPDATE documents SET principals = $4, acl_synced_at = ${SYNCED_AT(5)}
+       WHERE organization_id = $1 AND collection_id = $2 AND key = $3
+         AND acl_synced_at <= ${SYNCED_AT(5)}`,
       [
         scope.organizationId,
         scope.collectionId,
         key,
         checkPrincipals(principals),
+        aclSyncedAt,
       ],
     );
   }
@@ -200,37 +241,56 @@ export class PgVectorIndex implements VectorIndex {
     if (
       !Number.isInteger(req.limit) ||
       req.limit < 1 ||
-      req.limit > MAX_SEARCH_LIMIT ||
-      !Number.isInteger(req.maxAclAgeMs) ||
-      req.maxAclAgeMs < 1 ||
-      !req.vector.every(Number.isFinite)
+      req.limit > MAX_SEARCH_LIMIT
     ) {
       throw invalid(`limit must be 1 to ${MAX_SEARCH_LIMIT}.`);
     }
+    if (
+      !Number.isInteger(req.maxAclAgeMs) ||
+      req.maxAclAgeMs < 1 ||
+      req.maxAclAgeMs > MAX_ACL_AGE_MS
+    ) {
+      throw invalid(`maxAclAgeMs must be 1 to ${MAX_ACL_AGE_MS}.`);
+    }
+    if (
+      !req.vector.every(Number.isFinite) ||
+      req.vector.every((v) => v === 0)
+    ) {
+      throw invalid("the vector must be finite and not all zero.");
+    }
     const principals = checkPrincipals(req.principals);
     if (principals.length === 0) return [];
-    const dims = await this.dimensions(this.pool, scope);
-    if (req.vector.length !== dims) {
-      throw invalid("the vector does not match the collection's dimensions.");
-    }
-    const { rows } = await this.pool.query(
-      `SELECT c.chunk_id, c.key, d.revision, c.span_start, c.span_end, c.body,
-              1 - (c.embedding <=> $3::vector) AS score
-       FROM chunks c
-       JOIN documents d USING (organization_id, collection_id, key)
-       WHERE c.organization_id = $1 AND c.collection_id = $2
-         AND d.principals && $4::text[]
-         AND d.acl_synced_at > now() - ($5 * interval '1 millisecond')
-       ORDER BY c.embedding <=> $3::vector, c.chunk_id
-       LIMIT $6`,
-      [
-        scope.organizationId,
-        scope.collectionId,
-        vectorLiteral(req.vector),
-        principals,
-        req.maxAclAgeMs,
-        req.limit,
-      ],
+    const rows = await inTransaction(
+      this.pool,
+      async (client) => {
+        const dims = await this.dimensions(client, scope);
+        if (req.vector.length !== dims) {
+          throw invalid(
+            "the vector does not match the collection's dimensions.",
+          );
+        }
+        const res = await client.query(
+          `SELECT c.chunk_id, c.key, d.revision, c.span_start, c.span_end, c.body,
+                  1 - (c.embedding <=> $3::vector) AS score
+           FROM chunks c
+           JOIN documents d USING (organization_id, collection_id, key)
+           WHERE c.organization_id = $1 AND c.collection_id = $2
+             AND d.principals && $4::text[]
+             AND d.acl_synced_at > clock_timestamp() - ($5 * interval '1 millisecond')
+           ORDER BY c.embedding <=> $3::vector, c.chunk_id
+           LIMIT $6`,
+          [
+            scope.organizationId,
+            scope.collectionId,
+            vectorLiteral(req.vector),
+            principals,
+            req.maxAclAgeMs,
+            req.limit,
+          ],
+        );
+        return res.rows;
+      },
+      { readOnly: true, timeoutMs: this.searchTimeoutMs },
     );
     return rows.map((r) => ({
       chunkId: r.chunk_id,

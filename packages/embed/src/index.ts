@@ -35,6 +35,8 @@ export interface IndexedDocument {
   revision: string;
   /** Principal keys allowed to read it (ADR-0005), captured at sync time. */
   principals: string[];
+  /** Epoch ms at which the source was asked for `principals`; a write older than the stored one is dropped. */
+  aclSyncedAt: number;
   chunks: IndexedChunk[];
 }
 
@@ -70,6 +72,7 @@ export interface VectorIndex {
     scope: Scope,
     key: string,
     principals: string[],
+    aclSyncedAt: number,
     signal?: AbortSignal,
   ): Promise<void>;
   /** Tombstones: the document is excluded from search at once. */
