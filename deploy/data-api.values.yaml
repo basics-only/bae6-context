@@ -11,8 +11,9 @@ autoscaling:
   # Postgres sources: poolMax x maxReplicas must fit each database's connection share.
   maxReplicas: 6
 
-# Drain delay + the longest source call (60 s Postgres default) + margin.
-terminationGracePeriodSeconds: 80
+# Drain delay (10 s) + main.ts hard exit (BAE6_REQUEST_TIMEOUT_MS 90 s + 5 s) + margin. The
+# longest request (10 s open + 60 s Postgres call + 30 s write deadline) fits before the exit.
+terminationGracePeriodSeconds: 120
 
 env:
   BAE6_SHUTDOWN_DELAY_MS: "10000"

@@ -38,7 +38,8 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const BODY_DEADLINE_MS = 10_000;
 // A client that stops reading must not keep a buffered response in memory.
 const WRITE_DEADLINE_MS = 30_000;
-const MAX_CONNECTIONS = 1024;
+// Bounds bodies being read before admission: MAX_CONNECTIONS x MAX_BODY_BYTES.
+const MAX_CONNECTIONS = 256;
 const TOKEN = /^[A-Za-z0-9._~+/-]{1,8192}=*$/;
 const REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const RANGE = /^bytes=(\d{1,15})-(\d{1,15})$/;
@@ -331,6 +332,10 @@ export function createDataApi(deps: DataApiDeps) {
 
   /** Takes a slot until the response is flushed or dropped, so buffered bodies count too. */
   function admit(res: ServerResponse, org: string, bound?: BoundSource) {
+    // A response that closed during an earlier await never emits `close` again.
+    if (res.closed) {
+      throw new HttpError(499, "cancelled", "The client went away.");
+    }
     const used = bound ? (busy.get(bound) ?? 0) : 0;
     const orgUsed = perOrg.get(org) ?? 0;
     if (
@@ -398,8 +403,8 @@ export function createDataApi(deps: DataApiDeps) {
       if (!res.headersSent) send(res, e.status, envelope(e, requestId));
       else res.end();
     }
-    if (!res.writableFinished) {
-      const t = setTimeout(() => res.destroy(), WRITE_DEADLINE_MS);
+    if (!res.writableFinished && !res.closed) {
+      const t = setTimeout(() => res.destroy(), WRITE_DEADLINE_MS).unref();
       res.once("close", () => clearTimeout(t));
     }
   });

@@ -108,7 +108,13 @@ const identities: Record<string, Identity> = {
 };
 const logs: Record<string, unknown>[] = [];
 const server = createDataApi({
-  verify: async (t) => (t ? (identities[t] ?? null) : null),
+  verify: async (t) => {
+    if (t === "slow") {
+      await new Promise((r) => setTimeout(r, 50));
+      return identities.acme ?? null;
+    }
+    return t ? (identities[t] ?? null) : null;
+  },
   sources,
   maxInflight: 8,
   maxInflightPerOrganization: 2,
@@ -282,6 +288,21 @@ test("one organization cannot take every slot on the replica", async () => {
   slowReads = false;
   for (const f of finishReads.splice(0)) f();
   for (const r of await Promise.all(pending)) await r.arrayBuffer();
+});
+
+test("a client that leaves before admission holds no slot", async () => {
+  const { request } = await import("node:http");
+  for (let i = 0; i < 3; i++) {
+    const dropped = request(`${base}/v1/sources`, {
+      headers: { authorization: "Bearer slow" },
+    });
+    dropped.on("error", () => {});
+    dropped.end();
+    await new Promise((r) => setTimeout(r, 10));
+    dropped.destroy();
+  }
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal((await call("GET", "/v1/sources", "acme")).status, 200);
 });
 
 test("a malformed or repeated source token is refused", async () => {
