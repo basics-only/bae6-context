@@ -29,7 +29,7 @@ export function prefixAcl(
     sorted.find((r) => info.key.startsWith(r.prefix))?.principals ?? [];
 }
 
-interface Deps {
+export interface Deps {
   source: ObjectSource;
   model: EmbeddingModel;
   index: VectorIndex;
