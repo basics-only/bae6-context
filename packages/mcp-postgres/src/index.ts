@@ -11,7 +11,7 @@ import type { Pool, PoolClient } from "pg";
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS mcp_servers (
   organization text NOT NULL,
-  id text NOT NULL,
+  id text COLLATE "C" NOT NULL,
   team text NOT NULL,
   name text NOT NULL,
   description text,
@@ -105,7 +105,11 @@ export class PgRegistryStore implements RegistryStore {
   static async migrate(pool: Pool) {
     await inTransaction(pool, async (client) => {
       await client.query("SELECT pg_advisory_xact_lock($1)", [MIGRATION_LOCK]);
-      await client.query(SCHEMA);
+      // The last table is created in the same transaction, so its presence means all exist.
+      const { rows } = await client.query(
+        "SELECT to_regclass('mcp_health') AS t",
+      );
+      if (rows[0].t === null) await client.query(SCHEMA);
     });
   }
 

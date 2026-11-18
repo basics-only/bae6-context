@@ -7,8 +7,18 @@ import { PgRegistryStore } from "./index.js";
 const url = process.env.BAE6_MCP_DATABASE_URL;
 const skip = url ? false : "BAE6_MCP_DATABASE_URL not set";
 
-const alice: Caller = { subject: "alice", actor: "alice", requestId: "r1" };
-const bob: Caller = { subject: "bob", actor: "bob", requestId: "r2" };
+const alice: Caller = {
+  subject: "alice",
+  workload: "alice",
+  actor: "alice",
+  requestId: "r1",
+};
+const bob: Caller = {
+  subject: "bob",
+  workload: "bob",
+  actor: "bob",
+  requestId: "r2",
+};
 
 const body = (id: string, version = "1.0.0") => ({
   id,
