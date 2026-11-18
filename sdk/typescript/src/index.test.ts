@@ -17,6 +17,7 @@ import {
   ContextTransportError,
   DataClient,
   EmbedClient,
+  RegistryClient,
   Transport,
 } from "./index.js";
 
@@ -341,6 +342,111 @@ test("embed refuses dot segments and unknown sync states", async () => {
   reply = json(200, { ...sync, state: "bogus" });
   await assert.rejects(
     embed().getSync("kb", "s1"),
+    ContextInvalidResponseError,
+  );
+});
+
+const registry = () =>
+  new RegistryClient({ baseUrl: base, credentials: "svc-token" });
+const version = {
+  version: "1.0.0",
+  endpoint: "https://mcp.example.com/mcp",
+  protocolVersion: "2025-06-18",
+  transport: "streamable-http" as const,
+  authentication: { method: "none" as const },
+};
+const mcp = {
+  id: "docs",
+  organization: "acme",
+  team: "platform",
+  name: "Docs",
+  createdAt: "2026-01-01T00:00:00Z",
+  versions: [],
+};
+
+test("registry calls hit the documented routes and carry the end-user token", async () => {
+  seen = [];
+  reply = json(201, mcp);
+  await registry().createServer(
+    { id: "docs", team: "platform", name: "Docs", version },
+    { endUserToken: "user-token" },
+  );
+  await registry().createVersion("docs", version);
+  reply = json(200, mcp);
+  await registry().approveVersion("docs", {
+    version: "1.0.0",
+    scanStatus: "clean",
+  });
+  await registry().revokeVersion("docs");
+  await registry().getServer("docs");
+  reply = json(200, { items: [mcp], nextCursor: "c2" });
+  const page = await registry().listServers({ cursor: "c1", limit: 5 });
+  reply = json(200, {
+    version: "1.0.0",
+    status: "healthy",
+    checkedAt: mcp.createdAt,
+  });
+  await registry().getServerHealth("docs", { version: "1.0.0" });
+  assert.deepEqual(
+    seen.map((s) => [s.method, s.url]),
+    [
+      ["POST", "/v1/servers"],
+      ["POST", "/v1/servers/docs/versions"],
+      ["POST", "/v1/servers/docs/approve"],
+      ["POST", "/v1/servers/docs/revoke"],
+      ["GET", "/v1/servers/docs"],
+      ["GET", "/v1/servers?cursor=c1&limit=5"],
+      ["GET", "/v1/servers/docs/health?version=1.0.0"],
+    ],
+  );
+  assert.equal(seen[0]?.headers["bae6-end-user-token"], "user-token");
+  assert.equal(seen[1]?.headers["bae6-end-user-token"], undefined);
+  assert.deepEqual(JSON.parse(seen[2]?.body ?? ""), {
+    version: "1.0.0",
+    scanStatus: "clean",
+  });
+  assert.deepEqual(JSON.parse(seen[3]?.body ?? ""), {});
+  assert.equal(page.nextCursor, "c2");
+});
+
+test("registry errors surface the envelope and a mutation is not retried", async () => {
+  seen = [];
+  reply = json(409, { code: "conflict", message: "exists", requestId: "r2" });
+  await assert.rejects(
+    registry().createServer({
+      id: "docs",
+      team: "platform",
+      name: "Docs",
+      version,
+    }),
+    { status: 409, code: "conflict", requestId: "r2" },
+  );
+  reply = json(503, { code: "unavailable", message: "x" });
+  await assert.rejects(
+    registry().approveVersion("docs", { version: "1.0.0" }),
+    ContextApiError,
+  );
+  assert.equal(seen.length, 2);
+  seen = [];
+  await assert.rejects(registry().getServer("docs"), ContextApiError);
+  assert.equal(seen.length, 3);
+});
+
+test("registry refuses dot segments and unusable bodies", async () => {
+  seen = [];
+  await assert.rejects(registry().getServer(".."), ContextError);
+  await assert.rejects(registry().revokeVersion("."), ContextError);
+  assert.equal(seen.length, 0);
+  reply = json(200, { id: "docs" });
+  await assert.rejects(
+    registry().getServer("docs"),
+    ContextInvalidResponseError,
+  );
+  reply = json(200, { items: [{ id: "docs" }] });
+  await assert.rejects(registry().listServers(), ContextInvalidResponseError);
+  reply = json(200, { version: "1", status: "meh", checkedAt: "x" });
+  await assert.rejects(
+    registry().getServerHealth("docs"),
     ContextInvalidResponseError,
   );
 });

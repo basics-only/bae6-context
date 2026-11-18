@@ -495,6 +495,186 @@ def _sync(body: object) -> dict[str, Any]:
     return body
 
 
+def _server(server_id: str) -> str:
+    return f"/v1/servers/{_segment(server_id)}"
+
+
+def _mcp_server(body: object) -> dict[str, Any]:
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("id"), str)
+        or not isinstance(body.get("versions"), list)
+    ):
+        raise _invalid()
+    return body
+
+
+class RegistryClient:
+    """The bae6-context MCP registry: a tenant-scoped catalog of MCP servers.
+
+    Mutations are POSTs and are never retried.
+    Use `async with RegistryClient(...) as registry` so connections are closed.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        credentials: str,
+        timeout: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._http = Transport(base_url, credentials, timeout, transport)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+    async def create_server(
+        self,
+        id: str,
+        team: str,
+        name: str,
+        version: dict[str, Any],
+        *,
+        description: str | None = None,
+        end_user_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Registers a server with its first version, which starts `pending`. Needs `mcp:publish`."""
+        payload: dict[str, Any] = {
+            "id": id,
+            "team": team,
+            "name": name,
+            "version": version,
+        }
+        if description is not None:
+            payload["description"] = description
+        return _mcp_server(
+            await self._http.request(
+                "POST",
+                "/v1/servers",
+                body=payload,
+                headers=_headers(end_user_token),
+            )
+        )
+
+    async def list_servers(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        end_user_token: str | None = None,
+    ) -> dict[str, Any]:
+        params = {
+            k: str(v)
+            for k, v in (("cursor", cursor), ("limit", limit))
+            if v is not None
+        }
+        body = await self._http.request(
+            "GET", "/v1/servers", params=params, headers=_headers(end_user_token)
+        )
+        if not isinstance(body, dict) or not isinstance(body.get("items"), list):
+            raise _invalid()
+        for item in body["items"]:
+            _mcp_server(item)
+        return body
+
+    async def get_server(
+        self, server_id: str, *, end_user_token: str | None = None
+    ) -> dict[str, Any]:
+        return _mcp_server(
+            await self._http.request(
+                "GET", _server(server_id), headers=_headers(end_user_token)
+            )
+        )
+
+    async def create_version(
+        self,
+        server_id: str,
+        version: dict[str, Any],
+        *,
+        end_user_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Publishes a new `pending` version. Needs `mcp:publish`."""
+        return _mcp_server(
+            await self._http.request(
+                "POST",
+                f"{_server(server_id)}/versions",
+                body=version,
+                headers=_headers(end_user_token),
+            )
+        )
+
+    async def approve_version(
+        self,
+        server_id: str,
+        version: str,
+        *,
+        scan_status: str | None = None,
+        end_user_token: str | None = None,
+    ) -> dict[str, Any]:
+        """The approver cannot be the version's publisher. Needs `mcp:approve`."""
+        payload = {"version": version}
+        if scan_status is not None:
+            payload["scanStatus"] = scan_status
+        return _mcp_server(
+            await self._http.request(
+                "POST",
+                f"{_server(server_id)}/approve",
+                body=payload,
+                headers=_headers(end_user_token),
+            )
+        )
+
+    async def revoke_version(
+        self,
+        server_id: str,
+        *,
+        version: str | None = None,
+        end_user_token: str | None = None,
+    ) -> dict[str, Any]:
+        """One version, or every version when `version` is absent. Irreversible. Needs `mcp:approve`."""
+        return _mcp_server(
+            await self._http.request(
+                "POST",
+                f"{_server(server_id)}/revoke",
+                body={} if version is None else {"version": version},
+                headers=_headers(end_user_token),
+            )
+        )
+
+    async def get_server_health(
+        self,
+        server_id: str,
+        *,
+        version: str | None = None,
+        end_user_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Probes an approved version, the latest when `version` is absent. Needs `mcp:discover`."""
+        body = await self._http.request(
+            "GET",
+            f"{_server(server_id)}/health",
+            params={} if version is None else {"version": version},
+            headers=_headers(end_user_token),
+        )
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("version"), str)
+            or body.get("status") not in ("healthy", "unhealthy")
+        ):
+            raise _invalid()
+        return body
+
+
 def _headers(end_user_token: str | None) -> dict[str, str]:
     return {"bae6-end-user-token": end_user_token} if end_user_token else {}
 

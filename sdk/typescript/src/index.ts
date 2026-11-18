@@ -513,6 +513,195 @@ export class EmbedClient {
   }
 }
 
+export interface McpCapability {
+  name: string;
+  description?: string;
+}
+
+export interface McpVersionInput {
+  version: string;
+  endpoint: string;
+  protocolVersion: string;
+  transport: "streamable-http";
+  authentication: {
+    method: "oauth2" | "none";
+    resource?: string;
+    requiredScopes?: string[];
+  };
+  tools?: McpCapability[];
+  resources?: McpCapability[];
+  prompts?: McpCapability[];
+  allowedNetworkZones?: string[];
+}
+
+export interface McpVersion extends McpVersionInput {
+  state: "pending" | "approved" | "revoked";
+  scanStatus: "unscanned" | "clean";
+  publishedBy: string;
+  publishedVia: string;
+  publishedAt: string;
+  decidedBy?: string;
+  decidedAt?: string;
+}
+
+export interface McpServer {
+  id: string;
+  organization: string;
+  team: string;
+  name: string;
+  description?: string;
+  createdAt: string;
+  versions: McpVersion[];
+}
+
+export interface McpServerHealth {
+  version: string;
+  status: "healthy" | "unhealthy";
+  checkedAt: string;
+  reason?: string;
+}
+
+const server = (id: string) => `/v1/servers/${segment(id)}`;
+
+function mcpServer(body: unknown): McpServer {
+  if (
+    !isObject(body) ||
+    typeof body.id !== "string" ||
+    !Array.isArray(body.versions)
+  ) {
+    throw invalid();
+  }
+  return body as unknown as McpServer;
+}
+
+/**
+ * The bae6-context MCP registry: a tenant-scoped catalog of MCP servers.
+ * Mutations are POSTs and are never retried.
+ */
+export class RegistryClient {
+  readonly #http: Transport;
+
+  constructor(options: ContextOptions) {
+    this.#http = new Transport(options);
+  }
+
+  /** Registers a server with its first version, which starts `pending`. Needs `mcp:publish`. */
+  async createServer(
+    request: {
+      id: string;
+      team: string;
+      name: string;
+      description?: string;
+      version: McpVersionInput;
+    },
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("POST", "/v1/servers", {
+        body: request,
+        headers: headers(options),
+        ...signal(options),
+      }),
+    );
+  }
+
+  async listServers(
+    page: { cursor?: string; limit?: number } = {},
+    options: CallOptions = {},
+  ): Promise<{ items: McpServer[]; nextCursor?: string }> {
+    const q = new URLSearchParams();
+    if (page.cursor !== undefined) q.set("cursor", page.cursor);
+    if (page.limit !== undefined) q.set("limit", String(page.limit));
+    const body = await this.#http.request("GET", `/v1/servers?${q}`, {
+      headers: headers(options),
+      ...signal(options),
+    });
+    if (!isObject(body) || !Array.isArray(body.items)) throw invalid();
+    body.items.forEach(mcpServer);
+    return body as { items: McpServer[]; nextCursor?: string };
+  }
+
+  async getServer(
+    serverId: string,
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("GET", server(serverId), {
+        headers: headers(options),
+        ...signal(options),
+      }),
+    );
+  }
+
+  /** Publishes a new `pending` version. Needs `mcp:publish`. */
+  async createVersion(
+    serverId: string,
+    version: McpVersionInput,
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("POST", `${server(serverId)}/versions`, {
+        body: version,
+        headers: headers(options),
+        ...signal(options),
+      }),
+    );
+  }
+
+  /** The approver cannot be the version's publisher. Needs `mcp:approve`. */
+  async approveVersion(
+    serverId: string,
+    request: { version: string; scanStatus?: "unscanned" | "clean" },
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("POST", `${server(serverId)}/approve`, {
+        body: request,
+        headers: headers(options),
+        ...signal(options),
+      }),
+    );
+  }
+
+  /** One version, or every version when `version` is absent. Irreversible. Needs `mcp:approve`. */
+  async revokeVersion(
+    serverId: string,
+    request: { version?: string } = {},
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("POST", `${server(serverId)}/revoke`, {
+        body: request,
+        headers: headers(options),
+        ...signal(options),
+      }),
+    );
+  }
+
+  /** Probes an approved version, the latest when `version` is absent. Needs `mcp:discover`. */
+  async getServerHealth(
+    serverId: string,
+    request: { version?: string } = {},
+    options: CallOptions = {},
+  ): Promise<McpServerHealth> {
+    const q = new URLSearchParams();
+    if (request.version !== undefined) q.set("version", request.version);
+    const body = await this.#http.request(
+      "GET",
+      `${server(serverId)}/health?${q}`,
+      { headers: headers(options), ...signal(options) },
+    );
+    if (
+      !isObject(body) ||
+      typeof body.version !== "string" ||
+      (body.status !== "healthy" && body.status !== "unhealthy")
+    ) {
+      throw invalid();
+    }
+    return body as unknown as McpServerHealth;
+  }
+}
+
 const signal = (o: CallOptions) => (o.signal ? { signal: o.signal } : {});
 
 function target(key: string, versionId: string | undefined) {
