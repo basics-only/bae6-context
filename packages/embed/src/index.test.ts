@@ -246,6 +246,57 @@ test("unusable vectors and non-text objects are not indexed", async () => {
   );
 });
 
+test("a changed object that fails to index is removed, not left under its old ACL", async () => {
+  const { deps, index, model, source } = setup({ "a.txt": "cat" });
+  await syncCollection(deps, scope);
+  source.bump("a.txt");
+  model.bad = true;
+  const result = await syncCollection(deps, scope);
+  assert.equal(result.failed, 1);
+  assert.equal((await index.revisions(scope, 10)).size, 0);
+});
+
+test("a prefix sync leaves documents outside the prefix alone", async () => {
+  const { deps, index } = setup({ "a.txt": "cat", "docs/b.txt": "dog" });
+  await syncCollection(deps, scope);
+  const result = await syncCollection(deps, scope, { prefix: "docs/" });
+  assert.equal(result.removed, 0);
+  assert.equal((await index.revisions(scope, 10)).size, 2);
+});
+
+test("an ACL resolver outage aborts the sync and removes nothing", async () => {
+  const { deps, index } = setup({ "a.txt": "cat" });
+  await syncCollection(deps, scope);
+  const down = {
+    ...deps,
+    acl: async () => {
+      throw new Error("down");
+    },
+  };
+  await assert.rejects(syncCollection(down, scope));
+  assert.equal((await index.revisions(scope, 10)).size, 1);
+});
+
+test("odd sizes still give integer spans that match the text", () => {
+  const text = "ab cd ".repeat(100);
+  for (const c of chunkText("k", text, { size: 101, overlap: 10 })) {
+    assert.ok(Number.isInteger(c.start) && Number.isInteger(c.end));
+    assert.equal(c.text, text.slice(c.start, c.end));
+  }
+});
+
+test("chunk ids differ between tenants indexing the same text", async () => {
+  const { deps, index } = setup({ "a.txt": "cat" });
+  await syncCollection(deps, scope);
+  const other = { ...scope, organizationId: "globex" };
+  await syncCollection(deps, other);
+  const ids = (s: Scope) =>
+    [...index.docs.entries()]
+      .filter(([k]) => k.startsWith(`${s.organizationId}/`))
+      .flatMap(([, d]) => d.chunks.map((c) => c.id));
+  assert.notDeepEqual(ids(scope), ids(other));
+});
+
 test("principals must be user: or group: keys", async () => {
   assert.throws(() => prefixAcl([{ prefix: "", principals: ["everyone"] }]), {
     code: "invalid_request",

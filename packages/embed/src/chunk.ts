@@ -40,8 +40,9 @@ export function chunkText(
   while (start < text.length) {
     let end = Math.min(start + size, text.length);
     if (end < text.length) {
-      const cut = text.slice(start + size / 2, end).search(/\s\S*$/);
-      if (cut >= 0) end = start + size / 2 + cut + 1;
+      const from = start + Math.floor(size / 2);
+      const cut = text.slice(from, end).search(/\s\S*$/);
+      if (cut >= 0) end = from + cut + 1;
     }
     if (chunks.length === maxChunks) {
       throw new EmbedError(

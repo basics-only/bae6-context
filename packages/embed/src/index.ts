@@ -53,6 +53,8 @@ export interface SearchRequest {
   limit: number;
   /** The caller's own principals, never taken from the request body. */
   principals: string[];
+  /** Documents whose ACL was last refreshed longer ago than this are excluded (ADR-0005). */
+  maxAclAgeMs: number;
 }
 
 /** An index replaces and removes whole documents, so a partly written revision is never visible. */

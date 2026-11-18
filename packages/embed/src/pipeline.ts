@@ -58,13 +58,23 @@ export async function ingestObject(
     ...(info.versionId ? { versionId: info.versionId } : {}),
     ...(signal ? { signal } : {}),
   });
+  if (revisionOf(read) !== revisionOf(info)) {
+    throw new EmbedError(
+      "invalid_request",
+      "the object changed while syncing.",
+    );
+  }
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(body);
   } catch {
     throw new EmbedError("invalid_request", "the object is not UTF-8 text.");
   }
-  const chunks = chunkText(info.key, text, deps.chunking);
+  const chunks = chunkText(
+    `${scope.organizationId}\0${scope.collectionId}\0${info.key}`,
+    text,
+    deps.chunking,
+  );
   const indexed: IndexedChunk[] = [];
   for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
     const batch = chunks.slice(i, i + EMBED_BATCH);
@@ -103,7 +113,7 @@ export interface SyncResult {
   ingested: number;
   refreshed: number;
   removed: number;
-  /** Objects that could not be indexed this round; they stay out of search once their ACL is stale. */
+  /** Objects that could not be indexed this round; they were removed until the next sync succeeds. */
   failed: number;
 }
 
@@ -153,12 +163,13 @@ export async function syncCollection(
   for (const info of listed) {
     if (signal?.aborted)
       throw new EmbedError("cancelled", "the sync was cancelled.");
+    // A resolver error aborts the sync: an outage must not delete what is indexed.
+    const principals = TEXT_KEY.test(info.key)
+      ? await deps.acl(info, signal)
+      : [];
+    if (principals.length === 0) continue;
+    seen.add(info.key);
     try {
-      const principals = TEXT_KEY.test(info.key)
-        ? await deps.acl(info, signal)
-        : [];
-      if (principals.length === 0) continue;
-      seen.add(info.key);
       if (known.get(info.key) === revisionOf(info)) {
         await deps.index.refreshAcl(
           scope,
@@ -173,11 +184,15 @@ export async function syncCollection(
       }
     } catch (err) {
       if (signal?.aborted) throw err;
+      // Fail closed: the old revision may carry an ACL that has since been revoked.
+      await deps.index.remove(scope, info.key, signal);
       result.failed++;
     }
   }
   for (const key of known.keys()) {
-    if (seen.has(key)) continue;
+    if (seen.has(key) || (prefix !== undefined && !key.startsWith(prefix))) {
+      continue;
+    }
     await deps.index.remove(scope, key, signal);
     result.removed++;
   }
