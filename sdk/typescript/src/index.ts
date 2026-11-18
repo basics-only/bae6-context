@@ -373,7 +373,7 @@ const SYNC_STATES = ["queued", "running", "succeeded", "failed"];
 
 // fetch resolves "." and ".." segments, which would send the request elsewhere.
 function segment(id: string) {
-  if (id === "." || id === "..") {
+  if (id === "" || id === "." || id === "..") {
     throw new ContextError("not a valid identifier");
   }
   return enc(id);
@@ -510,6 +510,218 @@ export class EmbedClient {
       throw invalid();
     }
     return body as unknown as Sync;
+  }
+}
+
+export interface McpCapability {
+  name: string;
+  description?: string;
+}
+
+export interface McpVersionInput {
+  version: string;
+  endpoint: string;
+  protocolVersion: string;
+  transport: "streamable-http";
+  authentication: {
+    method: "oauth2" | "none";
+    resource?: string;
+    requiredScopes?: string[];
+  };
+  tools?: McpCapability[];
+  resources?: McpCapability[];
+  prompts?: McpCapability[];
+  allowedNetworkZones?: string[];
+}
+
+export interface McpVersion extends McpVersionInput {
+  state: "pending" | "approved" | "revoked";
+  scanStatus: "unscanned" | "clean";
+  publishedBy: string;
+  publishedVia: string;
+  publishedAt: string;
+  decidedBy?: string;
+  decidedAt?: string;
+}
+
+export interface McpServer {
+  id: string;
+  organization: string;
+  team: string;
+  name: string;
+  description?: string;
+  createdAt: string;
+  versions: McpVersion[];
+}
+
+export interface McpServerHealth {
+  version: string;
+  status: "healthy" | "unhealthy";
+  checkedAt: string;
+  reason?: string;
+}
+
+const server = (id: string) => `/v1/servers/${segment(id)}`;
+
+const MCP_STATES = ["pending", "approved", "revoked"];
+const query = (q: URLSearchParams) => (q.size ? `?${q}` : "");
+
+/** `id`: the server the request named; a response about another one is refused. */
+function mcpServer(body: unknown, id?: string): McpServer {
+  if (
+    !isObject(body) ||
+    !["id", "organization", "team", "name", "createdAt"].every(
+      (k) => typeof body[k] === "string",
+    ) ||
+    (id !== undefined && body.id !== id) ||
+    !Array.isArray(body.versions) ||
+    !body.versions.every(
+      (v) => isObject(v) && MCP_STATES.includes(v.state as string),
+    )
+  ) {
+    throw invalid();
+  }
+  return body as unknown as McpServer;
+}
+
+/**
+ * The bae6-context MCP registry: a tenant-scoped catalog of MCP servers.
+ * Mutations are POSTs and are never retried.
+ */
+export class RegistryClient {
+  readonly #http: Transport;
+
+  constructor(options: ContextOptions) {
+    this.#http = new Transport(options);
+  }
+
+  /** Registers a server with its first version, which starts `pending`. Needs `mcp:publish`. */
+  async createServer(
+    request: {
+      id: string;
+      team: string;
+      name: string;
+      description?: string;
+      version: McpVersionInput;
+    },
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("POST", "/v1/servers", {
+        body: request,
+        headers: headers(options),
+        ...signal(options),
+      }),
+      request.id,
+    );
+  }
+
+  async listServers(
+    page: { cursor?: string; limit?: number } = {},
+    options: CallOptions = {},
+  ): Promise<{ items: McpServer[]; nextCursor?: string }> {
+    const q = new URLSearchParams();
+    if (page.cursor !== undefined) q.set("cursor", page.cursor);
+    if (page.limit !== undefined) q.set("limit", String(page.limit));
+    const body = await this.#http.request("GET", `/v1/servers${query(q)}`, {
+      headers: headers(options),
+      ...signal(options),
+    });
+    if (
+      !isObject(body) ||
+      !Array.isArray(body.items) ||
+      (body.nextCursor !== undefined && typeof body.nextCursor !== "string")
+    ) {
+      throw invalid();
+    }
+    for (const item of body.items) mcpServer(item);
+    return body as { items: McpServer[]; nextCursor?: string };
+  }
+
+  async getServer(
+    serverId: string,
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("GET", server(serverId), {
+        headers: headers(options),
+        ...signal(options),
+      }),
+      serverId,
+    );
+  }
+
+  /** Publishes a new `pending` version. Needs `mcp:publish`. */
+  async createVersion(
+    serverId: string,
+    version: McpVersionInput,
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("POST", `${server(serverId)}/versions`, {
+        body: version,
+        headers: headers(options),
+        ...signal(options),
+      }),
+      serverId,
+    );
+  }
+
+  /** The approver cannot be the version's publisher. Needs `mcp:approve`. */
+  async approveVersion(
+    serverId: string,
+    request: { version: string; scanStatus?: "unscanned" | "clean" },
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("POST", `${server(serverId)}/approve`, {
+        body: request,
+        headers: headers(options),
+        ...signal(options),
+      }),
+      serverId,
+    );
+  }
+
+  /** One version, or every version when `version` is absent. Irreversible. Needs `mcp:approve`. */
+  async revokeVersion(
+    serverId: string,
+    request: { version?: string } = {},
+    options: CallOptions = {},
+  ): Promise<McpServer> {
+    return mcpServer(
+      await this.#http.request("POST", `${server(serverId)}/revoke`, {
+        body: request,
+        headers: headers(options),
+        ...signal(options),
+      }),
+      serverId,
+    );
+  }
+
+  /** Probes an approved version, the latest when `version` is absent. Needs `mcp:discover`. */
+  async getServerHealth(
+    serverId: string,
+    request: { version?: string } = {},
+    options: CallOptions = {},
+  ): Promise<McpServerHealth> {
+    const q = new URLSearchParams();
+    if (request.version !== undefined) q.set("version", request.version);
+    const body = await this.#http.request(
+      "GET",
+      `${server(serverId)}/health${query(q)}`,
+      { headers: headers(options), ...signal(options) },
+    );
+    if (
+      !isObject(body) ||
+      typeof body.version !== "string" ||
+      (request.version !== undefined && body.version !== request.version) ||
+      typeof body.checkedAt !== "string" ||
+      (body.status !== "healthy" && body.status !== "unhealthy")
+    ) {
+      throw invalid();
+    }
+    return body as unknown as McpServerHealth;
   }
 }
 

@@ -7,6 +7,7 @@ from .client import (
     DataClient,
     EmbedClient,
     ObjectContent,
+    RegistryClient,
     Transport,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "DataClient",
     "EmbedClient",
     "ObjectContent",
+    "RegistryClient",
     "Transport",
 ]
