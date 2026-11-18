@@ -222,6 +222,28 @@ test(
   },
 );
 
+test(
+  "a stale write cannot resurrect a removed document",
+  { skip },
+  async () => {
+    const scope = await fresh();
+    const readAt = Date.now() - 100;
+    await index.upsert(scope, doc("a.txt", ["user:alice"], [[1, 0]]));
+    await index.remove(scope, "a.txt");
+    await index.upsert(
+      scope,
+      doc("a.txt", ["user:alice"], [[1, 0]], "r2", readAt),
+    );
+    assert.deepEqual(await index.search(scope, q(["user:alice"])), []);
+    assert.equal((await index.revisions(scope, 10)).size, 0);
+    await index.upsert(
+      scope,
+      doc("a.txt", ["user:alice"], [[1, 0]], "r3", Date.now() + 50),
+    );
+    assert.equal((await index.search(scope, q(["user:alice"]))).length, 1);
+  },
+);
+
 test("two documents may reuse a chunk id", { skip }, async () => {
   const scope = await fresh();
   const one = doc("a.txt", ["user:alice"], [[1, 0]]);

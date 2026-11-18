@@ -12,7 +12,7 @@ import type { Pool, PoolClient } from "pg";
 export const MAX_SEARCH_LIMIT = 50;
 export const MAX_CHUNKS_PER_DOCUMENT = 500;
 export const MAX_ACL_AGE_MS = 7 * 24 * 3600 * 1000;
-const MAX_DIMENSIONS = 4096;
+const MAX_DIMENSIONS = 2000;
 const MIGRATION_LOCK = 6_201_104;
 
 const SCHEMA = `
@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS documents (
   revision text NOT NULL,
   principals text[] NOT NULL,
   acl_synced_at timestamptz NOT NULL,
+  deleted boolean NOT NULL DEFAULT false,
   PRIMARY KEY (organization_id, collection_id, key),
   FOREIGN KEY (organization_id, collection_id)
     REFERENCES collections ON DELETE CASCADE
@@ -118,7 +119,8 @@ export class PgVectorIndex implements VectorIndex {
       throw invalid(`dimensions must be 1 to ${MAX_DIMENSIONS}.`);
     }
     await this.pool.query(
-      `INSERT INTO collections VALUES ($1, $2, $3, $4)
+      `INSERT INTO collections (organization_id, collection_id, model_id, dimensions)
+       VALUES ($1, $2, $3, $4)
        ON CONFLICT DO NOTHING`,
       [scope.organizationId, scope.collectionId, modelId, dimensions],
     );
@@ -161,9 +163,11 @@ export class PgVectorIndex implements VectorIndex {
       }
       const key = [scope.organizationId, scope.collectionId, doc.key];
       const written = await client.query(
-        `INSERT INTO documents VALUES ($1, $2, $3, $4, $5, ${SYNCED_AT(6)})
+        `INSERT INTO documents (organization_id, collection_id, key, revision,
+                                principals, acl_synced_at)
+         VALUES ($1, $2, $3, $4, $5, ${SYNCED_AT(6)})
          ON CONFLICT (organization_id, collection_id, key)
-         DO UPDATE SET revision = $4, principals = $5,
+         DO UPDATE SET revision = $4, principals = $5, deleted = false,
                        acl_synced_at = EXCLUDED.acl_synced_at
          WHERE documents.acl_synced_at <= EXCLUDED.acl_synced_at`,
         [...key, doc.revision, principals, doc.aclSyncedAt],
@@ -176,7 +180,9 @@ export class PgVectorIndex implements VectorIndex {
       );
       for (const c of doc.chunks) {
         await client.query(
-          `INSERT INTO chunks VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector)`,
+          `INSERT INTO chunks (organization_id, collection_id, key, chunk_id,
+                               span_start, span_end, body, embedding)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector)`,
           [...key, c.id, c.start, c.end, c.text, vectorLiteral(c.vector)],
         );
       }
@@ -196,7 +202,7 @@ export class PgVectorIndex implements VectorIndex {
     await this.pool.query(
       `UPDATE documents SET principals = $4, acl_synced_at = ${SYNCED_AT(5)}
        WHERE organization_id = $1 AND collection_id = $2 AND key = $3
-         AND acl_synced_at <= ${SYNCED_AT(5)}`,
+         AND NOT deleted AND acl_synced_at <= ${SYNCED_AT(5)}`,
       [
         scope.organizationId,
         scope.collectionId,
@@ -209,18 +215,28 @@ export class PgVectorIndex implements VectorIndex {
 
   async remove(scope: Scope, key: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
-    await this.pool.query(
-      `DELETE FROM documents
-       WHERE organization_id = $1 AND collection_id = $2 AND key = $3`,
-      [scope.organizationId, scope.collectionId, key],
-    );
+    // shortcut: tombstones are never purged, so rows grow with keys ever seen; add a sweep when that matters.
+    await inTransaction(this.pool, async (client) => {
+      const key3 = [scope.organizationId, scope.collectionId, key];
+      await client.query(
+        `UPDATE documents SET deleted = true, principals = '{}', revision = '',
+                              acl_synced_at = clock_timestamp()
+         WHERE organization_id = $1 AND collection_id = $2 AND key = $3`,
+        key3,
+      );
+      await client.query(
+        `DELETE FROM chunks
+         WHERE organization_id = $1 AND collection_id = $2 AND key = $3`,
+        key3,
+      );
+    });
   }
 
   async revisions(scope: Scope, limit: number, signal?: AbortSignal) {
     signal?.throwIfAborted();
     const { rows } = await this.pool.query(
       `SELECT key, revision FROM documents
-       WHERE organization_id = $1 AND collection_id = $2 LIMIT $3`,
+       WHERE organization_id = $1 AND collection_id = $2 AND NOT deleted LIMIT $3`,
       [scope.organizationId, scope.collectionId, limit + 1],
     );
     if (rows.length > limit) {
