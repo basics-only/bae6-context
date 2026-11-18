@@ -42,9 +42,11 @@ export function signS3(input: {
     headers["x-amz-security-token"] = credentials.sessionToken;
   }
   const names = Object.keys(headers).sort();
+  const byte = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
   const query = [...url.searchParams]
-    .map(([k, v]) => `${encode(k)}=${encode(v)}`)
-    .sort()
+    .map(([k, v]) => [encode(k), encode(v)] as const)
+    .sort(([ak, av], [bk, bv]) => byte(ak, bk) || byte(av, bv))
+    .map(([k, v]) => `${k}=${v}`)
     .join("&");
   const canonical = [
     input.method,

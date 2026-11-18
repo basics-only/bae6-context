@@ -44,18 +44,17 @@ const DEFAULT_LIMITS: S3Limits = {
   maxTimeoutMs: 30_000,
 };
 
+/** Keys and prefixes: no control characters, lone surrogates, or . / .. segments. */
+const safePath = (p: unknown): p is string =>
+  typeof p === "string" &&
+  Buffer.byteLength(p) <= 1024 &&
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters
+  !/[\u0000-\u001f\u007f]|\p{Cs}/u.test(p) &&
+  // URL parsing (or a filesystem-backed store) would resolve these.
+  !p.split("/").some((s) => s === "." || s === "..");
+
 function checkKey(key: unknown, prefix: string): string {
-  if (
-    typeof key !== "string" ||
-    key.length === 0 ||
-    Buffer.byteLength(key) > 1024 ||
-    // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters
-    /[\u0000-\u001f\u007f]/.test(key) ||
-    // URL parsing would resolve these, changing which key is signed and fetched.
-    key
-      .split("/")
-      .some((s) => s === "." || s === "..")
-  ) {
+  if (!safePath(key) || key.length === 0) {
     throw new DataError(
       "invalid_request",
       "key must be 1 to 1024 bytes with no control characters or . / .. segments.",
@@ -67,6 +66,14 @@ function checkKey(key: unknown, prefix: string): string {
   return key;
 }
 
+const malformed = () =>
+  new DataError("unavailable", "The object store sent a malformed response.");
+const iso = (v: string | null | undefined) => {
+  const t = Date.parse(v ?? "");
+  if (Number.isNaN(t)) throw malformed();
+  return new Date(t).toISOString();
+};
+
 const ENTITIES: Record<string, string> = {
   amp: "&",
   lt: "<",
@@ -74,14 +81,23 @@ const ENTITIES: Record<string, string> = {
   quot: '"',
   apos: "'",
 };
-const unxml = (s: string) =>
-  s.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (_, e: string) =>
-    e.startsWith("#x")
-      ? String.fromCodePoint(Number.parseInt(e.slice(2), 16))
-      : e.startsWith("#")
-        ? String.fromCodePoint(Number(e.slice(1)))
-        : (ENTITIES[e] as string),
-  );
+const unxml = (s: string) => {
+  try {
+    // Any & is an entity in well-formed XML; one this cannot decode means a malformed body.
+    return s.replace(/&([^;&]{0,10})(;?)/g, (_, e: string, end: string) => {
+      if (!end) throw malformed();
+      if (/^#x[0-9a-fA-F]{1,6}$/.test(e)) {
+        return String.fromCodePoint(Number.parseInt(e.slice(2), 16));
+      }
+      if (/^#\d{1,7}$/.test(e)) return String.fromCodePoint(Number(e.slice(1)));
+      const named = ENTITIES[e];
+      if (named === undefined) throw malformed();
+      return named;
+    });
+  } catch {
+    throw malformed();
+  }
+};
 const tag = (xml: string, name: string) => {
   const m = xml.match(new RegExp(`<${name}>([^<]*)</${name}>`));
   return m ? unxml(m[1] as string) : undefined;
@@ -91,6 +107,7 @@ const unquote = (etag: string) => etag.replace(/^"|"$/g, "");
 async function readCapped(
   res: Response,
   max: number,
+  signal: AbortSignal,
   caller: AbortSignal | undefined,
 ): Promise<Uint8Array> {
   const reader = res.body?.getReader();
@@ -101,9 +118,8 @@ async function readCapped(
     let r: ReadableStreamReadResult<Uint8Array>;
     try {
       r = await reader.read();
-    } catch (err) {
-      const name = (err as { name?: unknown } | null)?.name;
-      throw name === "AbortError" || name === "TimeoutError"
+    } catch {
+      throw signal.aborted
         ? abortError(caller)
         : new DataError("unavailable", "The object store connection failed.");
     }
@@ -123,8 +139,15 @@ export function createS3Source(cfg: S3Config): ObjectSource {
   if (!ID.test(cfg.id)) throw new Error(`id must match ${ID}`);
   if (!REGION.test(cfg.region)) throw new Error(`${cfg.id}: bad region`);
   if (!BUCKET.test(cfg.bucket)) throw new Error(`${cfg.id}: bad bucket name`);
-  if (typeof cfg.prefix !== "string" || Buffer.byteLength(cfg.prefix) > 512) {
-    throw new Error(`${cfg.id}: prefix must be a string of at most 512 bytes`);
+  // A prefix like "tenant1" would also match "tenant10/…".
+  if (
+    !safePath(cfg.prefix) ||
+    Buffer.byteLength(cfg.prefix) > 512 ||
+    !(cfg.prefix === "" || cfg.prefix.endsWith("/"))
+  ) {
+    throw new Error(
+      `${cfg.id}: prefix must be "" or end in "/", at most 512 bytes`,
+    );
   }
   const endpoint = new URL(
     cfg.endpoint ?? `https://s3.${cfg.region}.amazonaws.com`,
@@ -151,6 +174,7 @@ export function createS3Source(cfg: S3Config): ObjectSource {
     method: "GET" | "HEAD",
     key: string | undefined,
     query: Record<string, string | undefined>,
+    s: AbortSignal,
     caller: AbortSignal | undefined,
     extra: Record<string, string> = {},
   ): Promise<Response> {
@@ -162,7 +186,6 @@ export function createS3Source(cfg: S3Config): ObjectSource {
     for (const [k, v] of Object.entries(query)) {
       if (v !== undefined) url.searchParams.set(k, v);
     }
-    const s = signal(caller);
     let res: Response;
     try {
       const credentials = await cfg.credentials();
@@ -213,9 +236,7 @@ export function createS3Source(cfg: S3Config): ObjectSource {
       size,
       etag: unquote(res.headers.get("etag") ?? ""),
       ...(versionId && versionId !== "null" ? { versionId } : {}),
-      lastModified: new Date(
-        res.headers.get("last-modified") ?? 0,
-      ).toISOString(),
+      lastModified: iso(res.headers.get("last-modified")),
     };
   };
 
@@ -246,10 +267,10 @@ export function createS3Source(cfg: S3Config): ObjectSource {
 
     async list(req: ListRequest) {
       const prefix = req.prefix ?? cfg.prefix;
-      if (typeof prefix !== "string" || Buffer.byteLength(prefix) > 1024) {
+      if (!safePath(prefix)) {
         throw new DataError(
           "invalid_request",
-          "prefix must be at most 1024 bytes.",
+          "prefix must be at most 1024 bytes with no control characters or . / .. segments.",
         );
       }
       if (!prefix.startsWith(cfg.prefix)) {
@@ -269,6 +290,7 @@ export function createS3Source(cfg: S3Config): ObjectSource {
       ) {
         throw new DataError("invalid_request", "cursor is malformed.");
       }
+      const s = signal(req.signal);
       const res = await send(
         "GET",
         undefined,
@@ -278,24 +300,32 @@ export function createS3Source(cfg: S3Config): ObjectSource {
           "max-keys": String(limit),
           "continuation-token": req.cursor,
         },
+        s,
         req.signal,
       );
       const xml = Buffer.from(
-        await readCapped(res, MAX_LIST_RESPONSE_BYTES, req.signal),
+        await readCapped(res, MAX_LIST_RESPONSE_BYTES, s, req.signal),
       ).toString("utf8");
       const items: ObjectInfo[] = [];
       for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
         const c = m[1] as string;
         const key = tag(c, "Key");
-        // A store that ignores the prefix must not widen what this source exposes.
-        if (key === undefined || !key.startsWith(cfg.prefix)) continue;
+        const size = Number(tag(c, "Size"));
+        // A store that ignores the prefix or the limit must fail, never widen or silently drop.
+        if (
+          !safePath(key) ||
+          !key.startsWith(prefix) ||
+          !Number.isSafeInteger(size) ||
+          items.length === limit
+        ) {
+          throw malformed();
+        }
         items.push({
           key,
-          size: Number(tag(c, "Size") ?? 0),
+          size,
           etag: unquote(tag(c, "ETag") ?? ""),
-          lastModified: new Date(tag(c, "LastModified") ?? 0).toISOString(),
+          lastModified: iso(tag(c, "LastModified")),
         });
-        if (items.length === limit) break;
       }
       const next =
         tag(xml, "IsTruncated") === "true"
@@ -310,6 +340,7 @@ export function createS3Source(cfg: S3Config): ObjectSource {
         "HEAD",
         key,
         { versionId: checkVersion(req.versionId) },
+        signal(req.signal),
         req.signal,
       );
       return info(key, res, Number(res.headers.get("content-length") ?? 0));
@@ -340,7 +371,13 @@ export function createS3Source(cfg: S3Config): ObjectSource {
         }
         extra.range = `bytes=${start}-${end}`;
       }
-      const res = await send("GET", key, { versionId }, req.signal, extra);
+      const s = signal(req.signal);
+      const res = await send("GET", key, { versionId }, s, req.signal, extra);
+      // A store that ignores Range would hand back the whole object as if it were the range.
+      if (extra.range && res.status !== 206) {
+        await res.body?.cancel();
+        throw malformed();
+      }
       const length = Number(res.headers.get("content-length") ?? Number.NaN);
       if (length > limits.maxObjectBytes) {
         await res.body?.cancel();
@@ -350,7 +387,7 @@ export function createS3Source(cfg: S3Config): ObjectSource {
         );
       }
       const total = res.headers.get("content-range")?.match(/\/(\d+)$/)?.[1];
-      const body = await readCapped(res, limits.maxObjectBytes, req.signal);
+      const body = await readCapped(res, limits.maxObjectBytes, s, req.signal);
       return {
         info: info(key, res, total ? Number(total) : body.byteLength),
         body,
