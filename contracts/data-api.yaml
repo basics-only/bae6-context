@@ -1,0 +1,397 @@
+openapi: 3.1.0
+info:
+  title: bae6-context data API
+  version: 1.0.0
+  summary: Tenant-scoped, read-only access to configured Postgres, Databricks and S3 sources.
+  description: |
+    Sources are configured by the operator, each bound to one organization. Callers name a
+    source by ID; they never supply connection strings, hosts, buckets or credentials.
+
+    **Identity.** The workload is identified by its bearer token. The organization comes from
+    the token issuer's configuration, never from claims or bodies. With
+    `Bae6-End-User-Token` the user becomes the subject; both tokens must map to the same
+    organization and application, else `401`. Scopes always come from the workload token;
+    every endpoint needs `data:read`.
+
+    **Tenancy.** A source of another organization is `404 not_found`, the same as one that
+    does not exist.
+
+    **Access.** Each query result says whether the source saw the service's own credential
+    (`service_principal`) or the caller's token for that source (`delegated`). A delegated
+    source needs `Bae6-Source-Token`, a token issued for that source; no other source
+    accepts one.
+
+    **Limits.** Over-limit requests are refused, never clamped: `maxRows`, `timeoutMs` and
+    object sizes are capped per source (see `limits` in its descriptor). A result that
+    would exceed the source's byte limit is `too_large`. Bodies are at most 1 MiB.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://localhost:8080
+    description: Local development
+security:
+  - bearer: []
+paths:
+  /health/live:
+    $ref: "./vendor/openapi/common.yaml#/paths/~1health~1live"
+  /health/ready:
+    $ref: "./vendor/openapi/common.yaml#/paths/~1health~1ready"
+  /v1/sources:
+    get:
+      operationId: listSources
+      summary: The caller's organization's sources and what each supports.
+      parameters:
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The sources.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourceList"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+  /v1/sources/{sourceId}/query:
+    post:
+      operationId: query
+      summary: Runs one read-only statement on a query source.
+      description: |
+        Parameters use the source's own dialect: an array for Postgres (`$1`, `$2`), an object
+        for Databricks (`:name`). Writes, DDL and multiple statements are `403 forbidden`.
+        Safe to retry: nothing is written.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "#/components/parameters/SourceToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: The rows, in the source's text form.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResult"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "413":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+  /v1/sources/{sourceId}/objects:
+    get:
+      operationId: listObjects
+      summary: One page of objects on an object source, in key order.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+        - name: prefix
+          in: query
+          description: Within the source's own prefix.
+          schema:
+            type: string
+            maxLength: 1024
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/Cursor"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/Limit"
+      responses:
+        "200":
+          description: The page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectList"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+  /v1/sources/{sourceId}/objects/metadata:
+    get:
+      operationId: statObject
+      summary: One object's metadata.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Key"
+        - $ref: "#/components/parameters/VersionId"
+      responses:
+        "200":
+          description: The metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectInfo"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+  /v1/sources/{sourceId}/objects/content:
+    get:
+      operationId: readObject
+      summary: One object's bytes, or an inclusive byte range of them.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Key"
+        - $ref: "#/components/parameters/VersionId"
+        - name: Range
+          in: header
+          description: One range, `bytes=<start>-<end>`, both inclusive.
+          schema:
+            type: string
+            pattern: "^bytes=\\d{1,15}-\\d{1,15}$"
+      responses:
+        "200":
+          description: The whole object.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            Last-Modified:
+              $ref: "#/components/headers/LastModified"
+            Bae6-Version-Id:
+              $ref: "#/components/headers/VersionId"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentMediaType: application/octet-stream
+        "206":
+          description: The requested range.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            Last-Modified:
+              $ref: "#/components/headers/LastModified"
+            Bae6-Version-Id:
+              $ref: "#/components/headers/VersionId"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentMediaType: application/octet-stream
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+components:
+  securitySchemes:
+    bearer:
+      $ref: "./vendor/openapi/common.yaml#/components/securitySchemes/bearer"
+  parameters:
+    SourceId:
+      name: sourceId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9._-]{0,63}$"
+    EndUserToken:
+      name: Bae6-End-User-Token
+      in: header
+      description: Optional verified user token; the user becomes the subject.
+      schema:
+        type: string
+        maxLength: 8192
+    SourceToken:
+      name: Bae6-Source-Token
+      in: header
+      description: A token issued for the source itself. Required by delegated sources, refused by others.
+      schema:
+        type: string
+        maxLength: 8192
+    Key:
+      name: key
+      in: query
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 1024
+    VersionId:
+      name: versionId
+      in: query
+      schema:
+        type: string
+        maxLength: 1024
+  headers:
+    ETag:
+      schema:
+        type: string
+    LastModified:
+      schema:
+        type: string
+    VersionId:
+      description: Present when the source versions objects.
+      schema:
+        type: string
+  schemas:
+    SourceList:
+      type: object
+      required: [items]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "./vendor/schemas/capability-descriptor.json"
+    Scalar:
+      type: [string, number, boolean, "null"]
+    QueryRequest:
+      type: object
+      required: [statement]
+      additionalProperties: false
+      properties:
+        statement:
+          type: string
+          minLength: 1
+          maxLength: 100000
+        parameters:
+          oneOf:
+            - type: array
+              maxItems: 256
+              items:
+                $ref: "#/components/schemas/Scalar"
+            - type: object
+              maxProperties: 256
+              additionalProperties:
+                $ref: "#/components/schemas/Scalar"
+        maxRows:
+          type: integer
+          minimum: 1
+        timeoutMs:
+          type: integer
+          minimum: 1
+    QueryResult:
+      type: object
+      required: [columns, rows, truncated, access]
+      additionalProperties: false
+      properties:
+        columns:
+          type: array
+          items:
+            type: object
+            required: [name, type]
+            additionalProperties: false
+            properties:
+              name:
+                type: string
+              type:
+                type: string
+        rows:
+          description: Values in the source's text form; null is SQL NULL.
+          type: array
+          items:
+            type: array
+            items:
+              type: [string, "null"]
+        truncated:
+          description: True when rows stopped at `maxRows` or the byte limit.
+          type: boolean
+        access:
+          type: string
+          enum: [service_principal, delegated]
+    ObjectInfo:
+      type: object
+      required: [key, size, etag, lastModified]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        size:
+          type: integer
+          minimum: 0
+        etag:
+          type: string
+        versionId:
+          type: string
+        lastModified:
+          type: string
+          format: date-time
+    ObjectList:
+      type: object
+      required: [items]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/ObjectInfo"
+        nextCursor:
+          type: string
+          minLength: 1
+  responses:
+    InvalidRequest:
+      description: |
+        Malformed or over-limit input (`invalid_request`), an operation the source does not
+        support (`unsupported_operation`), or a result over the source's byte limit
+        (`too_large`). Not retryable unchanged.
+      headers:
+        X-Request-Id:
+          $ref: "./vendor/openapi/common.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "./vendor/openapi/common.yaml#/components/schemas/ErrorEnvelope"
+    Timeout:
+      description: The source did not answer in time.
+      headers:
+        X-Request-Id:
+          $ref: "./vendor/openapi/common.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "./vendor/openapi/common.yaml#/components/schemas/ErrorEnvelope"
