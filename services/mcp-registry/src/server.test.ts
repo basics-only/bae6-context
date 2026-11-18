@@ -243,6 +243,24 @@ test("hides pending and revoked servers from discover-only callers", async () =>
   assert.ok(!list.items.some((s) => s.id === "lifecycle"));
 });
 
+test("lets an approve-only caller read pending versions but not probe health", async () => {
+  await publish("manage");
+  const got = await call("GET", "/v1/servers/manage", "alice_approver");
+  assert.equal(got.status, 200);
+  assert.equal(
+    ((await got.json()) as { versions: unknown[] }).versions.length,
+    1,
+  );
+  assert.equal(
+    (await call("GET", "/v1/servers", "alice_approver")).status,
+    200,
+  );
+  assert.equal(
+    (await call("GET", "/v1/servers/manage/health", "alice_approver")).status,
+    403,
+  );
+});
+
 test("refuses approval by the publisher", async () => {
   await publish("self");
   assert.deepEqual(

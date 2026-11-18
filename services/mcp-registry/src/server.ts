@@ -60,14 +60,15 @@ const OPERATION: Record<string, Operation | undefined> = {
   "POST:id:revoke": "revokeVersion",
   "GET:id:health": "getServerHealth",
 };
-const SCOPE: Record<Operation, string> = {
-  createServer: "mcp:publish",
-  listServers: "mcp:discover",
-  getServer: "mcp:discover",
-  createVersion: "mcp:publish",
-  approveVersion: "mcp:approve",
-  revokeVersion: "mcp:approve",
-  getServerHealth: "mcp:discover",
+const ANY_SCOPE = ["mcp:discover", "mcp:publish", "mcp:approve"];
+const SCOPE: Record<Operation, string[]> = {
+  createServer: ["mcp:publish"],
+  listServers: ANY_SCOPE,
+  getServer: ANY_SCOPE,
+  createVersion: ["mcp:publish"],
+  approveVersion: ["mcp:approve"],
+  revokeVersion: ["mcp:approve"],
+  getServerHealth: ["mcp:discover"],
 };
 
 const STATUS: Record<RegistryErrorCode, number> = {
@@ -248,8 +249,12 @@ export function createRegistryApi(deps: RegistryApiDeps) {
       : undefined;
     if (!m || !op) throw notFound();
     const needed = SCOPE[op];
-    if (!who.scopes.includes(needed)) {
-      throw new HttpError(403, "forbidden", `Missing scope ${needed}.`);
+    if (!needed.some((s) => who.scopes.includes(s))) {
+      throw new HttpError(
+        403,
+        "forbidden",
+        `Missing scope ${needed.join(" or ")}.`,
+      );
     }
     const org = who.organizationId;
     const manage =
