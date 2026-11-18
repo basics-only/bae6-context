@@ -17,11 +17,13 @@ function int(name: string, fallback: number, min: number, max: number) {
   return v;
 }
 
+// Fails closed: an unset NODE_ENV is not development.
 const dev = (name: string) => {
   const on = env[name] === "true";
-  if (on && env.NODE_ENV === "production") {
-    throw new Error(`${name} is for development only`);
+  if (on && env.NODE_ENV !== "development") {
+    throw new Error(`${name} needs NODE_ENV=development`);
   }
+  if (on) log({ msg: "insecure_dev_flag", flag: name });
   return on;
 };
 const allowHttpJwks = dev("BAE6_ALLOW_HTTP_JWKS");
@@ -43,6 +45,13 @@ const config = parseConfig(JSON.parse(rawConfig), env);
 
 const port = int("PORT", 8080, 1, 65535);
 const maxInflight = int("BAE6_MAX_INFLIGHT", 16, 1, 10_000);
+const maxInflightPerOrganization = int(
+  "BAE6_MAX_INFLIGHT_PER_ORGANIZATION",
+  Math.max(1, Math.floor(maxInflight / 2)),
+  1,
+  maxInflight,
+);
+const openTimeoutMs = int("BAE6_SOURCE_OPEN_TIMEOUT_MS", 10_000, 100, 60_000);
 const shutdownDelayMs = int("BAE6_SHUTDOWN_DELAY_MS", 0, 0, 15_000);
 // Above every adapter's longest timeout (Postgres's 60 s default).
 const requestTimeoutMs = int("BAE6_REQUEST_TIMEOUT_MS", 90_000, 1000, 600_000);
@@ -87,17 +96,38 @@ const sources: BoundSource[] = config.map((c) => ({
   organization: c.organization,
   maxConcurrent: c.maxConcurrent,
   // One organization's unreachable source must not keep the API from starting for all.
-  open: lazy(async () => {
-    const s = await create(c);
+  open: lazy(() => opening(c)),
+}));
+
+async function opening(c: SourceConfig): Promise<Source> {
+  const pending = Promise.resolve().then(() => create(c));
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const s = await Promise.race([
+      pending,
+      new Promise<never>((_, fail) => {
+        timer = setTimeout(
+          () => fail(new Error(`${c.id} did not open in time`)),
+          openTimeoutMs,
+        );
+      }),
+    ]);
     opened.push(s);
     return s;
-  }),
-}));
+  } catch (err) {
+    // One that opens after its timeout is closed rather than leaked.
+    pending.then((s) => s.close()).catch(() => {});
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const server = createDataApi({
   verify: createVerifier(issuers, { allowHttpJwks }),
   sources,
   maxInflight,
+  maxInflightPerOrganization,
   requestTimeoutMs,
   log,
 });

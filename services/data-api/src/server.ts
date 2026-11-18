@@ -27,12 +27,19 @@ export interface DataApiDeps {
   verify: Verifier;
   sources: readonly BoundSource[];
   maxInflight: number;
-  /** Longest a request may take; above every source's own timeout. */
+  /** Below maxInflight, so one organization cannot take a whole replica. */
+  maxInflightPerOrganization: number;
+  /** Longest a client may take to send a request; source calls bound themselves. */
   requestTimeoutMs: number;
   log?: (event: Record<string, unknown>) => void;
 }
 
 const MAX_BODY_BYTES = 1024 * 1024;
+const BODY_DEADLINE_MS = 10_000;
+// A client that stops reading must not keep a buffered response in memory.
+const WRITE_DEADLINE_MS = 30_000;
+const MAX_CONNECTIONS = 1024;
+const TOKEN = /^[A-Za-z0-9._~+/-]{1,8192}=*$/;
 const REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const RANGE = /^bytes=(\d{1,15})-(\d{1,15})$/;
 const ROUTE =
@@ -80,6 +87,7 @@ export function createDataApi(deps: DataApiDeps) {
     byOrg.set(s.organization, org);
   }
   const busy = new Map<BoundSource, number>();
+  const perOrg = new Map<string, number>();
   let inflight = 0;
   let draining = false;
 
@@ -110,13 +118,8 @@ export function createDataApi(deps: DataApiDeps) {
     }
   }
 
-  async function query(
-    req: IncomingMessage,
-    res: ServerResponse,
-    bound: BoundSource,
-    signal: AbortSignal,
-  ) {
-    const body = await readJson(req, MAX_BODY_BYTES);
+  async function queryBody(req: IncomingMessage) {
+    const body = await readJson(req, MAX_BODY_BYTES, BODY_DEADLINE_MS);
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
       throw new HttpError(400, "invalid_request", "Body must be an object.");
     }
@@ -124,12 +127,30 @@ export function createDataApi(deps: DataApiDeps) {
     if (unknown !== undefined) {
       throw new HttpError(400, "invalid_request", `Unknown field ${unknown}.`);
     }
+    return body as { statement: string };
+  }
+
+  async function query(
+    req: IncomingMessage,
+    res: ServerResponse,
+    bound: BoundSource,
+    body: { statement: string },
+    signal: AbortSignal,
+  ) {
+    const sourceToken = header(req, "bae6-source-token");
+    // Node joins repeated headers with ", ", which no token contains.
+    if (sourceToken !== undefined && !TOKEN.test(sourceToken)) {
+      throw new HttpError(
+        400,
+        "invalid_request",
+        "Bae6-Source-Token is malformed.",
+      );
+    }
     const source = await open(bound);
     if (!("query" in source)) throw unsupported(bound, "query");
-    const sourceToken = header(req, "bae6-source-token");
     const result = await call(() =>
       source.query({
-        ...(body as { statement: string }),
+        ...body,
         signal,
         ...(sourceToken === undefined ? {} : { delegatedToken: sourceToken }),
       }),
@@ -194,6 +215,7 @@ export function createDataApi(deps: DataApiDeps) {
     );
     res.writeHead(span ? 206 : 200, {
       "content-type": "application/octet-stream",
+      "x-content-type-options": "nosniff",
       "content-length": body.byteLength,
       etag: `"${info.etag}"`,
       "last-modified": new Date(info.lastModified).toUTCString(),
@@ -265,11 +287,17 @@ export function createDataApi(deps: DataApiDeps) {
     const org = byOrg.get(who.organizationId);
 
     if (req.method === "GET" && path === "/v1/sources") {
-      const items = [];
-      for (const bound of org?.values() ?? []) {
-        items.push((await open(bound)).capabilities());
-      }
-      return send(res, 200, { items });
+      admit(res, who.organizationId);
+      const bounds = [...(org?.values() ?? [])];
+      const opened = await Promise.allSettled(bounds.map(open));
+      return send(res, 200, {
+        items: opened.flatMap((o) =>
+          o.status === "fulfilled" ? [o.value.capabilities()] : [],
+        ),
+        unavailable: bounds
+          .filter((_, i) => opened[i]?.status === "rejected")
+          .map((b) => b.id),
+      });
     }
 
     const m = ROUTE.exec(path);
@@ -277,14 +305,39 @@ export function createDataApi(deps: DataApiDeps) {
     if (!m || !op || req.method !== (op === "query" ? "POST" : "GET")) {
       throw notFound();
     }
-    const id = decodeURIComponent(m[1] as string);
+    let id: string;
+    try {
+      id = decodeURIComponent(m[1] as string);
+    } catch {
+      throw notFound();
+    }
     // Another organization's source is indistinguishable from a missing one (ADR-0002).
     const bound = SOURCE_ID.test(id) ? org?.get(id) : undefined;
     if (!bound) throw notFound();
     Object.assign(access, { sourceId: bound.id, operation: op });
 
-    const used = busy.get(bound) ?? 0;
-    if (inflight >= deps.maxInflight || used >= bound.maxConcurrent) {
+    // A slow body must not hold a slot, so it is read before one is taken.
+    const body = op === "query" ? await queryBody(req) : undefined;
+    admit(res, who.organizationId, bound);
+    const closed = new AbortController();
+    // `req` closes once its body is read; only `res` closes on a client disconnect.
+    res.once("close", () => {
+      if (!res.writableEnded) closed.abort();
+    });
+    await (body
+      ? query(req, res, bound, body, closed.signal)
+      : objects(res, url, bound, op, header(req, "range"), closed.signal));
+  }
+
+  /** Takes a slot until the response is flushed or dropped, so buffered bodies count too. */
+  function admit(res: ServerResponse, org: string, bound?: BoundSource) {
+    const used = bound ? (busy.get(bound) ?? 0) : 0;
+    const orgUsed = perOrg.get(org) ?? 0;
+    if (
+      inflight >= deps.maxInflight ||
+      orgUsed >= deps.maxInflightPerOrganization ||
+      (bound && used >= bound.maxConcurrent)
+    ) {
       throw new HttpError(
         429,
         "rate_limited",
@@ -293,20 +346,13 @@ export function createDataApi(deps: DataApiDeps) {
       );
     }
     inflight++;
-    busy.set(bound, used + 1);
-    const closed = new AbortController();
-    // `req` closes once its body is read; only `res` closes on a client disconnect.
+    perOrg.set(org, orgUsed + 1);
+    if (bound) busy.set(bound, used + 1);
     res.once("close", () => {
-      if (!res.writableEnded) closed.abort();
-    });
-    try {
-      await (op === "query"
-        ? query(req, res, bound, closed.signal)
-        : objects(res, url, bound, op, header(req, "range"), closed.signal));
-    } finally {
       inflight--;
-      busy.set(bound, (busy.get(bound) ?? 1) - 1);
-    }
+      perOrg.set(org, (perOrg.get(org) ?? 1) - 1);
+      if (bound) busy.set(bound, (busy.get(bound) ?? 1) - 1);
+    });
   }
 
   const server = createServer(async (req, res) => {
@@ -342,8 +388,6 @@ export function createDataApi(deps: DataApiDeps) {
       let e: HttpError;
       if (err instanceof HttpError) {
         e = err;
-      } else if (err instanceof URIError) {
-        e = notFound();
       } else {
         log({ msg: "internal_error", requestId, error: (err as Error).name });
         e = new HttpError(500, "internal", "Internal error.");
@@ -354,8 +398,13 @@ export function createDataApi(deps: DataApiDeps) {
       if (!res.headersSent) send(res, e.status, envelope(e, requestId));
       else res.end();
     }
+    if (!res.writableFinished) {
+      const t = setTimeout(() => res.destroy(), WRITE_DEADLINE_MS);
+      res.once("close", () => clearTimeout(t));
+    }
   });
   server.headersTimeout = 10_000;
+  server.maxConnections = MAX_CONNECTIONS;
   server.requestTimeout = deps.requestTimeoutMs;
 
   return Object.assign(server, {

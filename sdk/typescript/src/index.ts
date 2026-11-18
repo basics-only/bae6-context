@@ -251,13 +251,22 @@ export class DataClient {
     this.#http = new Transport(options);
   }
 
-  async sources(options: CallOptions = {}): Promise<CapabilityDescriptor[]> {
+  /** `unavailable`: IDs of sources that could not be opened just now. */
+  async sources(
+    options: CallOptions = {},
+  ): Promise<{ items: CapabilityDescriptor[]; unavailable: string[] }> {
     const body = await this.#http.request("GET", "/v1/sources", {
       headers: headers(options),
       ...signal(options),
     });
-    if (!isObject(body) || !Array.isArray(body.items)) throw invalid();
-    return body.items as CapabilityDescriptor[];
+    if (
+      !isObject(body) ||
+      !Array.isArray(body.items) ||
+      !Array.isArray(body.unavailable)
+    ) {
+      throw invalid();
+    }
+    return body as { items: CapabilityDescriptor[]; unavailable: string[] };
   }
 
   /** `sourceToken`: a token issued for the source itself, for delegated sources only. */

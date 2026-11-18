@@ -201,6 +201,10 @@ paths:
         "206":
           description: The requested range.
           headers:
+            Content-Range:
+              description: "`bytes <start>-<end>/<object size>`."
+              schema:
+                type: string
             ETag:
               $ref: "#/components/headers/ETag"
             Last-Modified:
@@ -280,13 +284,18 @@ components:
   schemas:
     SourceList:
       type: object
-      required: [items]
+      required: [items, unavailable]
       additionalProperties: false
       properties:
         items:
           type: array
           items:
             $ref: "./vendor/schemas/capability-descriptor.json"
+        unavailable:
+          description: IDs of the organization's sources that could not be opened just now.
+          type: array
+          items:
+            type: string
     Scalar:
       type: [string, number, boolean, "null"]
     QueryRequest:

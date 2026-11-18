@@ -256,6 +256,9 @@ test("lists and stats objects", async () => {
   );
   reply = json(200, {
     items: [{ kind: "data_source", id: "db", operations: ["query"] }],
+    unavailable: ["lake"],
   });
-  assert.equal((await data().sources())[0]?.id, "db");
+  const listed = await data().sources();
+  assert.equal(listed.items[0]?.id, "db");
+  assert.deepEqual(listed.unavailable, ["lake"]);
 });

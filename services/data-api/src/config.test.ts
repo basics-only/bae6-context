@@ -84,14 +84,17 @@ test("refuses inline secrets, unknown keys, missing env and duplicates", () => {
   );
 });
 
-test("a lazy open is shared, and retried after a failure", async () => {
+test("a lazy open is shared, and retried only after a backoff", async () => {
   let n = 0;
   const open = lazy(async () => {
     n++;
     if (n === 1) throw new Error("down");
     return n;
-  });
+  }, 50);
   await assert.rejects(open(), /down/);
+  await assert.rejects(open(), /down/);
+  assert.equal(n, 1);
+  await new Promise((r) => setTimeout(r, 80));
   const [a, b] = await Promise.all([open(), open()]);
   assert.deepEqual([a, b, n], [2, 2, 2]);
 });

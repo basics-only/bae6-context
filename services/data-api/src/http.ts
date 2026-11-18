@@ -27,23 +27,39 @@ export function envelope(err: HttpError, requestId: string) {
   };
 }
 
-/** The body's JSON, refusing anything over `maxBytes`. */
+/** The body's JSON, refusing anything over `maxBytes` or slower than `deadlineMs`. */
 export async function readJson(
   req: IncomingMessage,
   maxBytes: number,
+  deadlineMs: number,
 ): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > maxBytes) {
-      throw new HttpError(
-        413,
-        "payload_too_large",
-        `Body over ${maxBytes} bytes.`,
-      );
+  const timer = setTimeout(
+    () =>
+      req.destroy(
+        new HttpError(408, "timeout", "The body did not arrive in time."),
+      ),
+    deadlineMs,
+  );
+  try {
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > maxBytes) {
+        throw new HttpError(
+          413,
+          "payload_too_large",
+          `Body over ${maxBytes} bytes.`,
+        );
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+  } catch (err) {
+    if (err instanceof HttpError) throw err;
+    // The client went away mid-body; nobody reads this answer.
+    throw new HttpError(400, "invalid_request", "The body could not be read.");
+  } finally {
+    clearTimeout(timer);
   }
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));

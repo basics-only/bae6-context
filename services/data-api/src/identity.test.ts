@@ -105,3 +105,23 @@ test("refuses issuer config without a tenant mapping", () => {
     /organization/,
   );
 });
+
+test("refuses issuer config without an audience, which would skip the check", () => {
+  const ok = {
+    issuer: "i",
+    audience: "a",
+    jwksUri: "https://x/jwks",
+    organization: "acme",
+    application: "crm",
+  };
+  for (const bad of [
+    { audience: undefined },
+    { audience: "" },
+    { issuer: 1 },
+  ]) {
+    assert.throws(
+      () => createVerifier([{ ...ok, ...bad } as never]),
+      /non-empty (audience|issuer)/,
+    );
+  }
+});

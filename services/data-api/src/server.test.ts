@@ -44,6 +44,8 @@ const info = {
   versionId: "v1",
   lastModified: "2026-01-01T00:00:00.000Z",
 };
+let slowReads = false;
+const finishReads: (() => void)[] = [];
 const docs: ObjectSource = {
   capabilities: () => descriptor("docs", ["list", "read", "stat"]),
   list: async (req) => ({
@@ -51,6 +53,7 @@ const docs: ObjectSource = {
     nextCursor: "c2",
   }),
   read: async (req) => {
+    if (slowReads) await new Promise<void>((ok) => finishReads.push(ok));
     const all = Buffer.from("hello world");
     return {
       info,
@@ -108,6 +111,7 @@ const server = createDataApi({
   verify: async (t) => (t ? (identities[t] ?? null) : null),
   sources,
   maxInflight: 8,
+  maxInflightPerOrganization: 2,
   requestTimeoutMs: 5000,
   log: (e) => logs.push(e),
 });
@@ -236,16 +240,64 @@ test("maps source errors to the envelope without inventing detail", async () => 
   assert.deepEqual(await codeOf(res), [500, "internal"]);
 });
 
-test("a source that cannot open is 503 for its organization only, and retried", async () => {
+test("a source that cannot open is 503 for its calls and listed as unavailable", async () => {
   const before = brokenOpens;
-  const res = await call("GET", "/v1/sources", "initech");
+  const listed = await call("GET", "/v1/sources", "initech");
+  assert.equal(listed.status, 200);
+  assert.deepEqual(await listed.json(), { items: [], unavailable: ["broken"] });
+  const res = await call("POST", "/v1/sources/broken/query", "initech", {
+    body: { statement: "SELECT 1" },
+  });
   const body = await res.text();
   assert.equal(res.status, 503);
   assert.doesNotMatch(body, /postgres|pw/);
-  assert.equal((await call("GET", "/v1/sources", "initech")).status, 503);
   assert.equal(brokenOpens - before, 2);
-  assert.equal((await call("GET", "/v1/sources", "acme")).status, 200);
   assert.ok(!JSON.stringify(logs).includes("pw@"));
+});
+
+test("a body that never finishes does not hold the source's only slot", async () => {
+  const { request } = await import("node:http");
+  const stalled = request(`${base}/v1/sources/db/query`, {
+    method: "POST",
+    headers: { authorization: "Bearer acme", "content-length": "100" },
+  });
+  stalled.on("error", () => {});
+  stalled.write('{"statement":');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal((await query("acme", { statement: "SELECT 1" })).status, 200);
+  stalled.destroy();
+});
+
+test("one organization cannot take every slot on the replica", async () => {
+  slowReads = true;
+  const pending = [0, 1].map(() =>
+    call("GET", "/v1/sources/docs/objects/content?key=acme%2Fa.txt", "acme"),
+  );
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(
+    await codeOf(await call("GET", "/v1/sources/docs/objects", "acme")),
+    [429, "rate_limited"],
+  );
+  assert.equal((await call("GET", "/v1/sources", "globex")).status, 200);
+  slowReads = false;
+  for (const f of finishReads.splice(0)) f();
+  for (const r of await Promise.all(pending)) await r.arrayBuffer();
+});
+
+test("a malformed or repeated source token is refused", async () => {
+  for (const token of ["a b", "a, b"]) {
+    assert.deepEqual(
+      await codeOf(
+        await query(
+          "acme",
+          { statement: "SELECT 1" },
+          { "bae6-source-token": token },
+        ),
+      ),
+      [400, "invalid_request"],
+    );
+  }
+  assert.equal(queries.length, 0);
 });
 
 test("refuses the wrong operation for a source's kind", async () => {

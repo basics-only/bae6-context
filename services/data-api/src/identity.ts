@@ -45,6 +45,13 @@ export function createVerifier(
     Issuer & { keys: ReturnType<typeof createRemoteJWKSet> }
   >();
   for (const i of issuers) {
+    // jose skips the audience check when it is undefined, so a missing one must not start.
+    for (const field of ["issuer", "audience"] as const) {
+      const v: unknown = i[field];
+      if (typeof v !== "string" || v === "" || v.length > 512) {
+        throw new Error(`every issuer needs a non-empty ${field}`);
+      }
+    }
     if (
       typeof i.organization !== "string" ||
       !SLUG.test(i.organization) ||

@@ -194,12 +194,17 @@ export function parseConfig(
   });
 }
 
-/** Opens on first use and shares the result; a failed open is retried on the next call. */
-export function lazy<T>(open: () => Promise<T>): () => Promise<T> {
+/** Opens on first use and shares the result; a failure is shared for `retryAfterMs`, then retried. */
+export function lazy<T>(
+  open: () => Promise<T>,
+  retryAfterMs = 2000,
+): () => Promise<T> {
   let opened: Promise<T> | undefined;
   return () => {
     opened ??= open().catch((err) => {
-      opened = undefined;
+      setTimeout(() => {
+        opened = undefined;
+      }, retryAfterMs).unref();
       throw err;
     });
     return opened;

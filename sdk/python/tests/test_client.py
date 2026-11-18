@@ -179,7 +179,11 @@ def test_lists_and_stats_objects() -> None:
             return httpx.Response(200, json=info)
         if request.url.path == "/v1/sources":
             return httpx.Response(
-                200, json={"items": [{"kind": "data_source", "id": "db"}]}
+                200,
+                json={
+                    "items": [{"kind": "data_source", "id": "db"}],
+                    "unavailable": ["lake"],
+                },
             )
         return httpx.Response(200, json={"items": [info], "nextCursor": "c"})
 
@@ -188,4 +192,5 @@ def test_lists_and_stats_objects() -> None:
     assert dict(seen[0].url.params) == {"prefix": "p/", "limit": "5"}
     assert run(handler, lambda d: d.stat_object("docs", "k", version_id="v")) == info
     assert dict(seen[1].url.params) == {"key": "k", "versionId": "v"}
-    assert run(handler, lambda d: d.sources())[0]["id"] == "db"
+    listed = run(handler, lambda d: d.sources())
+    assert (listed["items"][0]["id"], listed["unavailable"]) == ("db", ["lake"])

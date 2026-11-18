@@ -257,13 +257,18 @@ class DataClient:
 
     async def sources(
         self, *, end_user_token: str | None = None
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
+        """`unavailable`: IDs of sources that could not be opened just now."""
         body = await self._http.request(
             "GET", "/v1/sources", headers=_headers(end_user_token)
         )
-        if not isinstance(body, dict) or not isinstance(body.get("items"), list):
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("items"), list)
+            or not isinstance(body.get("unavailable"), list)
+        ):
             raise _invalid()
-        return body["items"]
+        return body
 
     async def query(
         self,
