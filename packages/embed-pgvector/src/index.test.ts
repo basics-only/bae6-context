@@ -89,7 +89,7 @@ test(
     assert.deepEqual(await index.search(other, q(["group:g"])), []);
     await assert.rejects(
       index.search({ ...other, collectionId: "missing" }, q(["group:g"])),
-      { code: "invalid_request" },
+      { code: "not_found" },
     );
   },
 );

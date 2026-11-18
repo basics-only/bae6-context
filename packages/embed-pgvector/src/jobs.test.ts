@@ -37,7 +37,7 @@ test(
     assert.equal((await q.enqueue(scope, "docs/")).id, a.id);
     assert.notEqual((await q.enqueue(scope, "")).id, a.id);
     await assert.rejects(q.enqueue({ ...scope, collectionId: "nope" }, ""), {
-      code: "invalid_request",
+      code: "not_found",
     });
     await assert.rejects(q.enqueue(scope, "x".repeat(1025)), {
       code: "invalid_request",

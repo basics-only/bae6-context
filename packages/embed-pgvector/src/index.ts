@@ -118,7 +118,9 @@ export class PgVectorIndex implements VectorIndex {
        WHERE organization_id = $1 AND collection_id = $2`,
       [scope.organizationId, scope.collectionId],
     );
-    if (rows.length === 0) throw invalid("unknown collection.");
+    if (rows.length === 0) {
+      throw new EmbedError("not_found", "unknown collection.");
+    }
     return rows[0].dimensions as number;
   }
 

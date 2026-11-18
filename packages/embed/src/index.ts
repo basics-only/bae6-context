@@ -100,6 +100,7 @@ export interface VectorIndex {
 
 export type EmbedErrorCode =
   | "invalid_request"
+  | "not_found"
   | "too_large"
   | "model_error"
   | "cancelled";
