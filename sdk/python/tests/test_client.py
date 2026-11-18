@@ -13,6 +13,7 @@ from bae6_context import (
     ContextTimeoutError,
     ContextTransportError,
     DataClient,
+    EmbedClient,
     Transport,
 )
 
@@ -194,3 +195,81 @@ def test_lists_and_stats_objects() -> None:
     assert dict(seen[1].url.params) == {"key": "k", "versionId": "v"}
     listed = run(handler, lambda d: d.sources())
     assert (listed["items"][0]["id"], listed["unavailable"]) == ("db", ["lake"])
+
+
+def run_embed(handler, call):
+    async def go():
+        async with EmbedClient(
+            "http://ctx", "svc-token", transport=httpx.MockTransport(handler)
+        ) as e:
+            return await call(e)
+
+    return asyncio.run(go())
+
+
+def test_embed_calls_hit_the_documented_routes_and_encode_caller_parts() -> None:
+    seen: list[httpx.Request] = []
+    sync = {"id": "s1", "state": "queued", "prefix": "docs/", "attempts": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.method == "PUT":
+            return httpx.Response(200, json={"id": "kb", "model": "m", "dimensions": 8})
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(202 if request.method == "POST" else 200, json=sync)
+
+    assert run_embed(handler, lambda e: e.create_collection("kb"))["dimensions"] == 8
+    assert run_embed(handler, lambda e: e.start_sync("kb", prefix="docs/")) == sync
+    assert run_embed(handler, lambda e: e.get_sync("kb", "s/1")) == sync
+    assert run_embed(handler, lambda e: e.delete_document("kb", "a b&c.txt")) is None
+    assert [(r.method, r.url.raw_path.split(b"?")[0]) for r in seen] == [
+        ("PUT", b"/v1/collections/kb"),
+        ("POST", b"/v1/collections/kb/syncs"),
+        ("GET", b"/v1/collections/kb/syncs/s%2F1"),
+        ("DELETE", b"/v1/collections/kb/documents"),
+    ]
+    assert json.loads(seen[1].content) == {"prefix": "docs/"}
+    assert seen[3].url.params["key"] == "a b&c.txt"
+
+
+def test_embed_search_returns_hits_and_never_sends_an_end_user_token() -> None:
+    seen: list[httpx.Request] = []
+    hit = {"chunkId": "c", "key": "k", "revision": "r", "start": 0, "end": 1}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"hits": [hit]})
+
+    assert run_embed(handler, lambda e: e.search("kb", "q", limit=3)) == [hit]
+    assert json.loads(seen[0].content) == {"query": "q", "limit": 3}
+    assert "bae6-end-user-token" not in seen[0].headers
+
+
+def test_embed_errors_surface_the_envelope_and_a_queued_sync_is_not_retried() -> None:
+    envelope = {"code": "not_found", "message": "Not found.", "requestId": "r1"}
+    with pytest.raises(ContextApiError) as err:
+        run_embed(
+            lambda _: httpx.Response(404, json=envelope),
+            lambda e: e.search("nope", "q"),
+        )
+    assert (err.value.status, err.value.code, err.value.request_id) == (
+        404,
+        "not_found",
+        "r1",
+    )
+    with pytest.raises(ContextInvalidResponseError):
+        run_embed(
+            lambda _: httpx.Response(200, json={"nothits": []}),
+            lambda e: e.search("kb", "q"),
+        )
+    calls = 0
+
+    def unavailable(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, json={"code": "unavailable", "message": "x"})
+
+    with pytest.raises(ContextApiError):
+        run_embed(unavailable, lambda e: e.start_sync("kb"))
+    assert calls == 1

@@ -384,6 +384,91 @@ class DataClient:
         )
 
 
+def _collection(collection_id: str) -> str:
+    return f"/v1/collections/{quote(collection_id, safe='')}"
+
+
+class EmbedClient:
+    """The bae6-context embed API: tenant-scoped sync and search over configured collections.
+
+    Acts as the workload token's subject; there is no end-user delegation.
+    Use `async with EmbedClient(...) as embed` so connections are closed.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        credentials: str,
+        timeout: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._http = Transport(base_url, credentials, timeout, transport)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+    async def create_collection(self, collection_id: str) -> dict[str, Any]:
+        """Provisions the configured collection's storage; a no-op when it exists."""
+        body = await self._http.request("PUT", _collection(collection_id))
+        if not isinstance(body, dict) or not isinstance(body.get("dimensions"), int):
+            raise _invalid()
+        return body
+
+    async def start_sync(
+        self, collection_id: str, *, prefix: str | None = None
+    ) -> dict[str, Any]:
+        """Not retried: each call queues a sync. `prefix` also matches keys that extend it."""
+        body = await self._http.request(
+            "POST",
+            f"{_collection(collection_id)}/syncs",
+            body={} if prefix is None else {"prefix": prefix},
+        )
+        return _sync(body)
+
+    async def get_sync(self, collection_id: str, sync_id: str) -> dict[str, Any]:
+        body = await self._http.request(
+            "GET", f"{_collection(collection_id)}/syncs/{quote(sync_id, safe='')}"
+        )
+        return _sync(body)
+
+    async def search(
+        self, collection_id: str, query: str, *, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Ranked for the workload token's subject: only chunks that subject may read."""
+        payload: dict[str, Any] = {"query": query}
+        if limit is not None:
+            payload["limit"] = limit
+        body = await self._http.request(
+            "POST", f"{_collection(collection_id)}/search", body=payload
+        )
+        if not isinstance(body, dict) or not isinstance(body.get("hits"), list):
+            raise _invalid()
+        return body["hits"]
+
+    async def delete_document(self, collection_id: str, key: str) -> None:
+        """Removes the key from the index only; the source object is untouched."""
+        await self._http.raw(
+            "DELETE", f"{_collection(collection_id)}/documents", params={"key": key}
+        )
+
+
+def _sync(body: object) -> dict[str, Any]:
+    if not isinstance(body, dict) or not isinstance(body.get("id"), str):
+        raise _invalid()
+    return body
+
+
 def _headers(end_user_token: str | None) -> dict[str, str]:
     return {"bae6-end-user-token": end_user_token} if end_user_token else {}
 

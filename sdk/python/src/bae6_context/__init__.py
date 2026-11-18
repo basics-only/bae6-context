@@ -5,6 +5,7 @@ from .client import (
     ContextTimeoutError,
     ContextTransportError,
     DataClient,
+    EmbedClient,
     ObjectContent,
     Transport,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "ContextTimeoutError",
     "ContextTransportError",
     "DataClient",
+    "EmbedClient",
     "ObjectContent",
     "Transport",
 ]
