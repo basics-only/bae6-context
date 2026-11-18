@@ -1,4 +1,5 @@
 import {
+  abortError,
   type CapabilityDescriptor,
   checkQuery,
   DataError,
@@ -12,7 +13,10 @@ import pg from "pg";
 
 export interface PostgresConfig {
   id: string;
-  /** From the operator's secret, never from a caller. The role should be read-only. */
+  /**
+   * From the operator's secret, never from a caller. Use a role with SELECT grants only; it
+   * can still cancel its own role's other sessions, so give each source its own role.
+   */
   connectionString: string;
   /** Size it for the replica count: poolMax × replicas ≤ this database's connection share. */
   poolMax: number;
@@ -20,7 +24,7 @@ export interface PostgresConfig {
 }
 
 const ID = /^[a-z0-9][a-z0-9._:/-]{0,127}$/;
-const FETCH_ROWS = 500;
+const MAX_FETCH_ROWS = 100;
 const DEFAULT_LIMITS: QueryLimits = {
   maxRows: 10_000,
   maxBytes: 16 * 1024 * 1024,
@@ -50,17 +54,27 @@ const TYPES: Record<number, string> = {
 // Every value stays in Postgres's text form: lossless, and the same shape as other sources.
 const text = { getTypeParser: () => (v: string) => v };
 
+// A role with any of these could write, read server files or bypass row security.
+const UNSAFE_ROLE = `
+  SELECT (r.rolsuper OR r.rolbypassrls
+    OR pg_has_role(current_user, 'pg_write_server_files', 'USAGE')
+    OR pg_has_role(current_user, 'pg_read_server_files', 'USAGE')
+    OR pg_has_role(current_user, 'pg_execute_server_program', 'USAGE')
+    OR pg_has_role(current_user, 'pg_signal_backend', 'USAGE')
+    OR EXISTS (SELECT 1 FROM pg_proc p
+               WHERE p.proname IN ('dblink', 'dblink_exec')
+                 AND has_function_privilege(p.oid, 'EXECUTE')))::text AS unsafe
+  FROM pg_roles r WHERE r.rolname = current_user`;
+
 function mapError(err: unknown): DataError {
   if (err instanceof DataError) return err;
-  const code = (err as { code?: unknown }).code;
+  if (err instanceof TypeError || err instanceof RangeError) throw err;
+  const code = (err as { code?: unknown } | null)?.code;
   if (typeof code !== "string" || !/^[0-9A-Z]{5}$/.test(code)) {
     return new DataError("unavailable", "The database is unreachable.");
   }
   if (code === "57014") {
-    return new DataError(
-      "timeout",
-      "The statement was cancelled or timed out.",
-    );
+    return new DataError("timeout", "The statement timed out.");
   }
   if (code === "25006" || code === "42501") {
     return new DataError(
@@ -68,8 +82,8 @@ function mapError(err: unknown): DataError {
       `The statement is not permitted (SQLSTATE ${code}).`,
     );
   }
-  // Caller errors: syntax, undefined objects, bad data, unsupported features.
-  if (/^(0A|21|22|23|42)/.test(code)) {
+  // Caller errors: syntax, undefined objects, bad data, wrong parameter count.
+  if (/^(0A|21|22|23|42)/.test(code) || code === "08P01") {
     return new DataError(
       "invalid_request",
       `The statement failed (SQLSTATE ${code}).`,
@@ -81,7 +95,7 @@ function mapError(err: unknown): DataError {
   );
 }
 
-/** A read-only query source. Refuses to start as a superuser, who could bypass read-only mode. */
+/** A read-only query source. Refuses a role that could write or bypass read-only mode. */
 export async function createPostgresSource(
   cfg: PostgresConfig,
 ): Promise<QuerySource> {
@@ -98,13 +112,14 @@ export async function createPostgresSource(
     application_name: "bae6-context-data",
     types: text,
   });
+  // An idle client that errors is already discarded by the pool; without a listener it would crash the process.
   pool.on("error", () => {});
   try {
-    const { rows } = await pool.query<{ rolsuper: string }>(
-      "SELECT rolsuper::text AS rolsuper FROM pg_roles WHERE rolname = current_user",
-    );
-    if (rows[0]?.rolsuper !== "false") {
-      throw new Error(`${cfg.id}: refusing to connect as a superuser`);
+    const { rows } = await pool.query<{ unsafe: string }>(UNSAFE_ROLE);
+    if (rows[0]?.unsafe !== "false") {
+      throw new Error(
+        `${cfg.id}: refusing a role that is a superuser, bypasses RLS, has server-file or signal roles, or can call dblink`,
+      );
     }
   } catch (err) {
     await pool.end();
@@ -128,6 +143,7 @@ export async function createPostgresSource(
 
     async query(req: QueryRequest): Promise<QueryResult> {
       const { maxRows, timeoutMs, signal } = checkQuery(req, limits);
+      const deadline = Date.now() + timeoutMs;
       if (req.delegatedToken !== undefined) {
         throw new DataError(
           "invalid_request",
@@ -152,30 +168,41 @@ export async function createPostgresSource(
         inflight--;
         throw new DataError("unavailable", "No database connection available.");
       }
+      let broken = false;
+      const onClientError = () => {
+        broken = true;
+      };
+      client.on("error", onClientError);
+      let cancelling: Promise<void> | undefined;
       // Not via the pool: with every pooled connection busy, the cancel would queue behind itself.
-      const cancel = async () => {
-        const c = new pg.Client({
-          connectionString: cfg.connectionString,
-          connectionTimeoutMillis: 2_000,
-        });
-        c.on("error", () => {});
-        try {
-          await c.connect();
-          await c.query("SELECT pg_cancel_backend($1)", [
-            (client as unknown as { processID: number }).processID,
-          ]);
-        } catch {
-          // statement_timeout still ends the query.
-        } finally {
-          await c.end().catch(() => {});
-        }
+      const cancel = () => {
+        cancelling = (async () => {
+          const c = new pg.Client({
+            connectionString: cfg.connectionString,
+            connectionTimeoutMillis: 2_000,
+          });
+          c.on("error", () => {});
+          try {
+            await c.connect();
+            await c.query("SELECT pg_cancel_backend($1)", [
+              (client as unknown as { processID: number }).processID,
+            ]);
+          } catch {
+            // The per-FETCH statement_timeout still ends it.
+            broken = true;
+          } finally {
+            await c.end().catch(() => {});
+          }
+        })();
       };
       signal.addEventListener("abort", cancel, { once: true });
-      let broken = false;
+      const remaining = () => {
+        if (signal.aborted) throw abortError(req.signal);
+        return Math.max(1, deadline - Date.now());
+      };
       try {
-        if (signal.aborted) throw new DataError("timeout", "Cancelled.");
         await client.query("BEGIN READ ONLY");
-        await client.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
+        await client.query(`SET LOCAL statement_timeout = ${remaining()}`);
         // Extended protocol: one statement only, so `…; COMMIT; INSERT …` cannot escape.
         // A cursor only accepts SELECT or VALUES.
         await client.query({
@@ -186,9 +213,22 @@ export async function createPostgresSource(
         const rows: (string | null)[][] = [];
         let columns: QueryResult["columns"] = [];
         let bytes = 0;
+        let largest = 0;
         let truncated = false;
         for (;;) {
-          const want = Math.min(FETCH_ROWS, maxRows + 1 - rows.length);
+          // Size each batch from the largest row so far against the bytes left, starting at
+          // one row. shortcut: a batch whose rows are far larger than earlier ones can still
+          // buffer batch × row size; cap column sizes in a view if a source has huge values.
+          const budget =
+            largest === 0
+              ? 1
+              : Math.floor((limits.maxBytes - bytes) / largest) + 1;
+          const want = Math.max(
+            1,
+            Math.min(MAX_FETCH_ROWS, maxRows + 1 - rows.length, budget),
+          );
+          // Reset each time: the caller's statement cannot turn the timeout off for later FETCHes.
+          await client.query(`SET LOCAL statement_timeout = ${remaining()}`);
           const r = await client.query<(string | null)[]>({
             text: `FETCH ${want} FROM bae6_result`,
             rowMode: "array",
@@ -200,8 +240,14 @@ export async function createPostgresSource(
             }));
           }
           for (const row of r.rows) {
-            // shortcut: one row is parsed before its size is known; bound column sizes at the source if that matters.
             const size = rowBytes(row);
+            largest = Math.max(largest, size);
+            if (rows.length === 0 && size > limits.maxBytes) {
+              throw new DataError(
+                "too_large",
+                `A single row is over ${limits.maxBytes} bytes.`,
+              );
+            }
             if (rows.length === maxRows || bytes + size > limits.maxBytes) {
               truncated = true;
               break;
@@ -211,20 +257,25 @@ export async function createPostgresSource(
           }
           if (truncated || r.rows.length < want) break;
         }
-        await client.query("ROLLBACK");
+        remaining();
         return { columns, rows, truncated, access: "service_principal" };
       } catch (err) {
-        await client.query("ROLLBACK").catch(() => {
-          broken = true;
-        });
-        throw signal.aborted
-          ? new DataError(
-              "timeout",
-              "The statement was cancelled or timed out.",
-            )
-          : mapError(err);
+        throw signal.aborted ? abortError(req.signal) : mapError(err);
       } finally {
         signal.removeEventListener("abort", cancel);
+        // A late cancel must land before the connection serves anyone else.
+        await cancelling;
+        // DISCARD ALL drops session state a statement could leave behind: advisory locks,
+        // settings, prepared statements, temp tables.
+        if (!broken) {
+          try {
+            await client.query("ROLLBACK");
+            await client.query("DISCARD ALL");
+          } catch {
+            broken = true;
+          }
+        }
+        client.off("error", onClientError);
         client.release(broken);
         inflight--;
       }

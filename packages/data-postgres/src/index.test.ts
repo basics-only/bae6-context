@@ -95,7 +95,7 @@ after(() => Promise.all(sources.map((s) => s.close())));
 test("refuses to start as a superuser", { skip }, async () => {
   await assert.rejects(
     createPostgresSource({ id: "pg", connectionString: urlFor(), poolMax: 1 }),
-    /superuser/,
+    /refusing a role/,
   );
 });
 
@@ -186,7 +186,7 @@ test(
       await code(
         s.query({ statement: "SELECT pg_sleep(10)", signal: caller.signal }),
       ),
-      "timeout",
+      "cancelled",
     );
     assert.ok(Date.now() - started < 2000);
     const running = await asAdmin((c) =>
@@ -221,5 +221,79 @@ test("refuses delegated tokens and named parameters", { skip }, async () => {
   assert.equal(
     await code(s.query({ statement: "SELECT $1", parameters: { a: 1 } })),
     "invalid_request",
+  );
+});
+
+test("session state does not leak to the next caller", { skip }, async () => {
+  const s = await source("bae6_data_ro", { poolMax: 1 });
+  await s.query({
+    statement:
+      "SELECT pg_advisory_lock(42), set_config('statement_timeout', '0', false)",
+  });
+  const locks = await asAdmin((c) =>
+    c.query(
+      "SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND objid = 42",
+    ),
+  );
+  assert.equal(locks.rows[0].n, 0);
+  const r = await s.query({
+    statement: "SELECT current_setting('statement_timeout')",
+  });
+  assert.notEqual(r.rows[0]?.[0], "0");
+});
+
+test(
+  "a statement cannot turn off the timeout for later fetches",
+  { skip },
+  async () => {
+    const s = await source("bae6_data_ro");
+    const started = Date.now();
+    assert.equal(
+      await code(
+        s.query({
+          statement: `SELECT i, set_config('statement_timeout', '0', true),
+                        CASE WHEN i > 1 THEN pg_sleep(5) END
+                      FROM generate_series(1, 3) i`,
+          timeoutMs: 500,
+        }),
+      ),
+      "timeout",
+    );
+    assert.ok(Date.now() - started < 2000);
+  },
+);
+
+test("one row over the byte limit is too_large", { skip }, async () => {
+  const s = await source("bae6_data_ro", { limits: { maxBytes: 100 } });
+  assert.equal(
+    await code(s.query({ statement: "SELECT repeat('x', 500)" })),
+    "too_large",
+  );
+});
+
+test("a wrong parameter count is the caller's error", { skip }, async () => {
+  const s = await source("bae6_data_ro");
+  assert.equal(
+    await code(s.query({ statement: "SELECT $1::int", parameters: [1, 2] })),
+    "invalid_request",
+  );
+});
+
+test("refuses a role that can signal other backends", { skip }, async () => {
+  await asAdmin((c) =>
+    c.query(`DO $$ BEGIN
+      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'bae6_data_sig') THEN
+        CREATE ROLE bae6_data_sig LOGIN PASSWORD 'bae6_data_sig';
+      END IF; END $$;
+      GRANT CONNECT ON DATABASE ${DB} TO bae6_data_sig;
+      GRANT pg_signal_backend TO bae6_data_sig`),
+  );
+  await assert.rejects(
+    createPostgresSource({
+      id: "pg",
+      connectionString: urlFor("bae6_data_sig"),
+      poolMax: 1,
+    }),
+    /refusing a role/,
   );
 });
