@@ -389,7 +389,7 @@ SYNC_STATES = {"queued", "running", "succeeded", "failed"}
 
 def _segment(identifier: str) -> str:
     # httpx resolves "." and ".." segments, which would send the request elsewhere.
-    if identifier in (".", ".."):
+    if identifier in ("", ".", ".."):
         raise ContextError("not a valid identifier")
     return quote(identifier, safe="")
 
@@ -499,11 +499,23 @@ def _server(server_id: str) -> str:
     return f"/v1/servers/{_segment(server_id)}"
 
 
-def _mcp_server(body: object) -> dict[str, Any]:
+MCP_STATES = {"pending", "approved", "revoked"}
+
+
+def _mcp_server(body: object, server_id: str | None = None) -> dict[str, Any]:
+    """`server_id`: the server the request named; a response about another one is refused."""
     if (
         not isinstance(body, dict)
-        or not isinstance(body.get("id"), str)
+        or not all(
+            isinstance(body.get(k), str)
+            for k in ("id", "organization", "team", "name", "createdAt")
+        )
+        or (server_id is not None and body["id"] != server_id)
         or not isinstance(body.get("versions"), list)
+        or not all(
+            isinstance(v, dict) and v.get("state") in MCP_STATES
+            for v in body["versions"]
+        )
     ):
         raise _invalid()
     return body
@@ -564,7 +576,8 @@ class RegistryClient:
                 "/v1/servers",
                 body=payload,
                 headers=_headers(end_user_token),
-            )
+            ),
+            id,
         )
 
     async def list_servers(
@@ -582,7 +595,11 @@ class RegistryClient:
         body = await self._http.request(
             "GET", "/v1/servers", params=params, headers=_headers(end_user_token)
         )
-        if not isinstance(body, dict) or not isinstance(body.get("items"), list):
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("items"), list)
+            or not isinstance(body.get("nextCursor", ""), str)
+        ):
             raise _invalid()
         for item in body["items"]:
             _mcp_server(item)
@@ -594,7 +611,8 @@ class RegistryClient:
         return _mcp_server(
             await self._http.request(
                 "GET", _server(server_id), headers=_headers(end_user_token)
-            )
+            ),
+            server_id,
         )
 
     async def create_version(
@@ -611,7 +629,8 @@ class RegistryClient:
                 f"{_server(server_id)}/versions",
                 body=version,
                 headers=_headers(end_user_token),
-            )
+            ),
+            server_id,
         )
 
     async def approve_version(
@@ -632,7 +651,8 @@ class RegistryClient:
                 f"{_server(server_id)}/approve",
                 body=payload,
                 headers=_headers(end_user_token),
-            )
+            ),
+            server_id,
         )
 
     async def revoke_version(
@@ -649,7 +669,8 @@ class RegistryClient:
                 f"{_server(server_id)}/revoke",
                 body={} if version is None else {"version": version},
                 headers=_headers(end_user_token),
-            )
+            ),
+            server_id,
         )
 
     async def get_server_health(
@@ -669,6 +690,8 @@ class RegistryClient:
         if (
             not isinstance(body, dict)
             or not isinstance(body.get("version"), str)
+            or (version is not None and body["version"] != version)
+            or not isinstance(body.get("checkedAt"), str)
             or body.get("status") not in ("healthy", "unhealthy")
         ):
             raise _invalid()

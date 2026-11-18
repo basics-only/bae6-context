@@ -413,3 +413,85 @@ def test_registry_refuses_dot_segments_and_unusable_bodies() -> None:
     bad = {"version": "1", "status": "meh", "checkedAt": "x"}
     with pytest.raises(ContextInvalidResponseError):
         run_registry(respond(bad), lambda r: r.get_server_health("docs"))
+
+
+def test_registry_refuses_an_empty_id_and_a_response_about_another_server() -> None:
+    seen: list[httpx.Request] = []
+
+    def respond(body: object):
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json=body)
+
+        return handler
+
+    with pytest.raises(ContextError):
+        run_registry(respond(MCP), lambda r: r.get_server(""))
+    assert seen == []
+    no_team = {k: v for k, v in MCP.items() if k != "team"}
+    for bad in (
+        {**MCP, "id": "other"},
+        {**MCP, "versions": [None]},
+        {**MCP, "versions": [{"state": "bogus"}]},
+        no_team,
+    ):
+        with pytest.raises(ContextInvalidResponseError):
+            run_registry(respond(bad), lambda r: r.approve_version("docs", "1.0.0"))
+    with pytest.raises(ContextInvalidResponseError):
+        run_registry(
+            respond({"items": [MCP], "nextCursor": 5}), lambda r: r.list_servers()
+        )
+    stale = {"version": "9", "status": "healthy", "checkedAt": "x"}
+    with pytest.raises(ContextInvalidResponseError):
+        run_registry(respond(stale), lambda r: r.get_server_health("docs", version="1"))
+
+
+def test_registry_sends_bare_urls_and_full_create_bodies() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        path = request.url.raw_path
+        if path == b"/v1/servers" and request.method == "GET":
+            return httpx.Response(200, json={"items": []})
+        if path.endswith(b"/health"):
+            return httpx.Response(
+                200, json={"version": "1", "status": "healthy", "checkedAt": "x"}
+            )
+        return httpx.Response(201, json=MCP)
+
+    run_registry(handler, lambda r: r.list_servers())
+    run_registry(handler, lambda r: r.get_server_health("docs"))
+    run_registry(
+        handler,
+        lambda r: r.create_server("docs", "platform", "Docs", VERSION, description="d"),
+    )
+    run_registry(handler, lambda r: r.create_version("docs", VERSION))
+    assert [r.url.raw_path for r in seen] == [
+        b"/v1/servers",
+        b"/v1/servers/docs/health",
+        b"/v1/servers",
+        b"/v1/servers/docs/versions",
+    ]
+    assert json.loads(seen[2].content) == {
+        "id": "docs",
+        "team": "platform",
+        "name": "Docs",
+        "description": "d",
+        "version": VERSION,
+    }
+    assert json.loads(seen[3].content) == VERSION
+    assert all(r.headers["authorization"] == "Bearer svc-token" for r in seen)
+
+
+def test_a_dropped_connection_on_a_registry_mutation_is_not_retried() -> None:
+    calls = 0
+
+    def drop(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.RemoteProtocolError("dropped", request=request)
+
+    with pytest.raises(ContextTransportError):
+        run_registry(drop, lambda r: r.revoke_version("docs"))
+    assert calls == 1

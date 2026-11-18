@@ -373,7 +373,7 @@ const SYNC_STATES = ["queued", "running", "succeeded", "failed"];
 
 // fetch resolves "." and ".." segments, which would send the request elsewhere.
 function segment(id: string) {
-  if (id === "." || id === "..") {
+  if (id === "" || id === "." || id === "..") {
     throw new ContextError("not a valid identifier");
   }
   return enc(id);
@@ -563,11 +563,21 @@ export interface McpServerHealth {
 
 const server = (id: string) => `/v1/servers/${segment(id)}`;
 
-function mcpServer(body: unknown): McpServer {
+const MCP_STATES = ["pending", "approved", "revoked"];
+const query = (q: URLSearchParams) => (q.size ? `?${q}` : "");
+
+/** `id`: the server the request named; a response about another one is refused. */
+function mcpServer(body: unknown, id?: string): McpServer {
   if (
     !isObject(body) ||
-    typeof body.id !== "string" ||
-    !Array.isArray(body.versions)
+    !["id", "organization", "team", "name", "createdAt"].every(
+      (k) => typeof body[k] === "string",
+    ) ||
+    (id !== undefined && body.id !== id) ||
+    !Array.isArray(body.versions) ||
+    !body.versions.every(
+      (v) => isObject(v) && MCP_STATES.includes(v.state as string),
+    )
   ) {
     throw invalid();
   }
@@ -602,6 +612,7 @@ export class RegistryClient {
         headers: headers(options),
         ...signal(options),
       }),
+      request.id,
     );
   }
 
@@ -612,12 +623,18 @@ export class RegistryClient {
     const q = new URLSearchParams();
     if (page.cursor !== undefined) q.set("cursor", page.cursor);
     if (page.limit !== undefined) q.set("limit", String(page.limit));
-    const body = await this.#http.request("GET", `/v1/servers?${q}`, {
+    const body = await this.#http.request("GET", `/v1/servers${query(q)}`, {
       headers: headers(options),
       ...signal(options),
     });
-    if (!isObject(body) || !Array.isArray(body.items)) throw invalid();
-    body.items.forEach(mcpServer);
+    if (
+      !isObject(body) ||
+      !Array.isArray(body.items) ||
+      (body.nextCursor !== undefined && typeof body.nextCursor !== "string")
+    ) {
+      throw invalid();
+    }
+    for (const item of body.items) mcpServer(item);
     return body as { items: McpServer[]; nextCursor?: string };
   }
 
@@ -630,6 +647,7 @@ export class RegistryClient {
         headers: headers(options),
         ...signal(options),
       }),
+      serverId,
     );
   }
 
@@ -645,6 +663,7 @@ export class RegistryClient {
         headers: headers(options),
         ...signal(options),
       }),
+      serverId,
     );
   }
 
@@ -660,6 +679,7 @@ export class RegistryClient {
         headers: headers(options),
         ...signal(options),
       }),
+      serverId,
     );
   }
 
@@ -675,6 +695,7 @@ export class RegistryClient {
         headers: headers(options),
         ...signal(options),
       }),
+      serverId,
     );
   }
 
@@ -688,12 +709,14 @@ export class RegistryClient {
     if (request.version !== undefined) q.set("version", request.version);
     const body = await this.#http.request(
       "GET",
-      `${server(serverId)}/health?${q}`,
+      `${server(serverId)}/health${query(q)}`,
       { headers: headers(options), ...signal(options) },
     );
     if (
       !isObject(body) ||
       typeof body.version !== "string" ||
+      (request.version !== undefined && body.version !== request.version) ||
+      typeof body.checkedAt !== "string" ||
       (body.status !== "healthy" && body.status !== "unhealthy")
     ) {
       throw invalid();

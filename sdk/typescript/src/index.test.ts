@@ -450,3 +450,79 @@ test("registry refuses dot segments and unusable bodies", async () => {
     ContextInvalidResponseError,
   );
 });
+
+test("registry refuses an empty id and a response about another server or version", async () => {
+  seen = [];
+  await assert.rejects(registry().getServer(""), ContextError);
+  assert.equal(seen.length, 0);
+  reply = json(200, { ...mcp, id: "other" });
+  await assert.rejects(
+    registry().approveVersion("docs", { version: "1.0.0" }),
+    ContextInvalidResponseError,
+  );
+  reply = json(200, { ...mcp, versions: [null] });
+  await assert.rejects(
+    registry().getServer("docs"),
+    ContextInvalidResponseError,
+  );
+  reply = json(200, { ...mcp, versions: [{ state: "bogus" }] });
+  await assert.rejects(
+    registry().getServer("docs"),
+    ContextInvalidResponseError,
+  );
+  const { team: _, ...noTeam } = mcp;
+  reply = json(200, noTeam);
+  await assert.rejects(
+    registry().getServer("docs"),
+    ContextInvalidResponseError,
+  );
+  reply = json(200, { items: [mcp], nextCursor: 5 });
+  await assert.rejects(registry().listServers(), ContextInvalidResponseError);
+  reply = json(200, { version: "9", status: "healthy", checkedAt: "x" });
+  await assert.rejects(
+    registry().getServerHealth("docs", { version: "1.0.0" }),
+    ContextInvalidResponseError,
+  );
+});
+
+test("registry sends bare URLs without a query and the full create bodies", async () => {
+  seen = [];
+  reply = json(200, { items: [] });
+  await registry().listServers();
+  reply = json(200, { version: "1", status: "healthy", checkedAt: "x" });
+  await registry().getServerHealth("docs");
+  reply = json(201, mcp);
+  await registry().createServer({
+    id: "docs",
+    team: "platform",
+    name: "Docs",
+    description: "d",
+    version,
+  });
+  await registry().createVersion("docs", version);
+  assert.deepEqual(
+    seen.map((s) => s.url),
+    [
+      "/v1/servers",
+      "/v1/servers/docs/health",
+      "/v1/servers",
+      "/v1/servers/docs/versions",
+    ],
+  );
+  assert.deepEqual(JSON.parse(seen[2]?.body ?? ""), {
+    id: "docs",
+    team: "platform",
+    name: "Docs",
+    description: "d",
+    version,
+  });
+  assert.deepEqual(JSON.parse(seen[3]?.body ?? ""), version);
+  assert.ok(seen.every((s) => s.headers.authorization === "Bearer svc-token"));
+});
+
+test("a dropped connection on a registry mutation is not retried", async () => {
+  seen = [];
+  reply = (res) => res.destroy();
+  await assert.rejects(registry().revokeVersion("docs"), ContextTransportError);
+  assert.equal(seen.length, 1);
+});
