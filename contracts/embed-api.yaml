@@ -1,0 +1,350 @@
+openapi: 3.1.0
+info:
+  title: bae6-context embed API
+  version: 1.0.0
+  summary: Tenant-scoped semantic search over documents synced from a configured object source.
+  description: |
+    Collections are configured by the operator, each bound to one organization, one object
+    source, one embedding model and the access rules that decide who may read which keys.
+    Callers name a collection by ID; they never supply sources, models or principals.
+
+    **Identity.** The workload is identified by its bearer token. The organization comes from
+    the token issuer's configuration, never from claims or bodies. With
+    `Bae6-End-User-Token` the user becomes the subject; both tokens must map to the same
+    organization and application, else `401`. Scopes always come from the workload token:
+    `embed:read` for search and reading syncs, `embed:write` for everything else.
+
+    **Tenancy.** A collection of another organization is `404 not_found`, the same as one
+    that does not exist.
+
+    **Access.** Search ranks only documents whose recorded access rules include the verified
+    subject (ADR-0005). Rules are captured at sync time; a document whose rules were last
+    confirmed longer ago than the service's `maxAclAgeMs` is not returned, so a source that
+    stops answering fails closed.
+
+    **Sync.** A sync is a durable job: it lists the source, embeds new or changed objects,
+    refreshes access rules, and removes what is gone. Starting one while the same prefix is
+    already waiting returns the waiting job. Failed objects are removed from the index until
+    a later sync succeeds.
+
+    **Limits.** Over-limit requests are refused, never clamped. Bodies are at most 64 KiB.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://localhost:8080
+    description: Local development
+security:
+  - bearer: []
+paths:
+  /health/live:
+    $ref: "./vendor/openapi/common.yaml#/paths/~1health~1live"
+  /health/ready:
+    $ref: "./vendor/openapi/common.yaml#/paths/~1health~1ready"
+  /v1/collections/{collectionId}:
+    put:
+      operationId: createCollection
+      summary: Provisions the configured collection's storage. Needs `embed:write`.
+      description: |
+        Idempotent. Fails with `409 conflict` when the collection already holds vectors from a
+        different model or size: a model change needs a new collection.
+      parameters:
+        - $ref: "#/components/parameters/CollectionId"
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The collection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Collection"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+  /v1/collections/{collectionId}/syncs:
+    post:
+      operationId: startSync
+      summary: Queues a sync of the source, or of the keys under `prefix`. Needs `embed:write`.
+      description: |
+        `prefix` also bounds which indexed documents may be removed. Re-syncing a single key
+        is a sync with that key as the prefix; it also covers keys that extend it.
+      parameters:
+        - $ref: "#/components/parameters/CollectionId"
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartSyncRequest"
+      responses:
+        "202":
+          description: The queued, or already waiting, job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sync"
+        "400":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "413":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+  /v1/collections/{collectionId}/syncs/{syncId}:
+    get:
+      operationId: getSync
+      summary: A sync's state and, once finished, its result. Needs `embed:read`.
+      parameters:
+        - $ref: "#/components/parameters/CollectionId"
+        - name: syncId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The sync.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sync"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+  /v1/collections/{collectionId}/search:
+    post:
+      operationId: search
+      summary: The chunks nearest to the query that the caller may read. Needs `embed:read`.
+      description: |
+        Exact nearest-neighbour search. Each hit cites its document, revision and the character
+        span of the chunk. Safe to retry: nothing is written.
+      parameters:
+        - $ref: "#/components/parameters/CollectionId"
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Hits, best first. Empty when the caller may read nothing relevant.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResult"
+        "400":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "413":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+  /v1/collections/{collectionId}/documents:
+    delete:
+      operationId: deleteDocument
+      summary: Removes one document from the index at once. Needs `embed:write`.
+      description: |
+        Deletes from the index, not the source: a later sync indexes the object again while it
+        exists. Idempotent; an unknown key is also `204`.
+      parameters:
+        - $ref: "#/components/parameters/CollectionId"
+        - name: key
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 1024
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+      responses:
+        "204":
+          description: Gone from search.
+        "400":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+components:
+  securitySchemes:
+    bearer:
+      $ref: "./vendor/openapi/common.yaml#/components/securitySchemes/bearer"
+  parameters:
+    CollectionId:
+      name: collectionId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9._-]{0,63}$"
+    EndUserToken:
+      name: Bae6-End-User-Token
+      in: header
+      description: Optional verified user token; the user becomes the subject.
+      schema:
+        type: string
+        maxLength: 8192
+  responses:
+    Conflict:
+      description: The request conflicts with the collection's stored state.
+      headers:
+        X-Request-Id:
+          $ref: "./vendor/openapi/common.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "./vendor/openapi/common.yaml#/components/schemas/ErrorEnvelope"
+  schemas:
+    Collection:
+      type: object
+      required: [id, model, dimensions]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+        model:
+          type: string
+        dimensions:
+          type: integer
+          minimum: 1
+    StartSyncRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        prefix:
+          description: Within the source's own prefix. Empty or absent syncs everything.
+          type: string
+          maxLength: 1024
+    SyncResult:
+      type: object
+      required: [ingested, refreshed, removed, failed]
+      additionalProperties: false
+      properties:
+        ingested:
+          type: integer
+          minimum: 0
+        refreshed:
+          type: integer
+          minimum: 0
+        removed:
+          type: integer
+          minimum: 0
+        failed:
+          description: Objects that could not be indexed; removed until a later sync succeeds.
+          type: integer
+          minimum: 0
+    Sync:
+      type: object
+      required: [id, state, prefix, attempts]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        prefix:
+          type: string
+        attempts:
+          type: integer
+          minimum: 0
+        result:
+          description: Present once `succeeded`.
+          $ref: "#/components/schemas/SyncResult"
+        errorCode:
+          description: Present once `failed`, or after a retryable failure.
+          type: string
+    SearchRequest:
+      type: object
+      required: [query]
+      additionalProperties: false
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 8000
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+    Hit:
+      type: object
+      required: [chunkId, key, revision, start, end, text, score]
+      additionalProperties: false
+      properties:
+        chunkId:
+          type: string
+        key:
+          type: string
+        revision:
+          description: The source's version of the object the chunk came from.
+          type: string
+        start:
+          description: Character offset of the chunk in the decoded document.
+          type: integer
+          minimum: 0
+        end:
+          type: integer
+          minimum: 0
+        text:
+          type: string
+        score:
+          description: Cosine similarity, higher is closer.
+          type: number
+    SearchResult:
+      type: object
+      required: [hits]
+      additionalProperties: false
+      properties:
+        hits:
+          type: array
+          maxItems: 50
+          items:
+            $ref: "#/components/schemas/Hit"

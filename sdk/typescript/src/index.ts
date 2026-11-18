@@ -369,6 +369,150 @@ export class DataClient {
   }
 }
 
+const SYNC_STATES = ["queued", "running", "succeeded", "failed"];
+
+// fetch resolves "." and ".." segments, which would send the request elsewhere.
+function segment(id: string) {
+  if (id === "." || id === "..") {
+    throw new ContextError("not a valid identifier");
+  }
+  return enc(id);
+}
+const collection = (id: string) => `/v1/collections/${segment(id)}`;
+
+/** The embed API acts as the workload token's subject; there is no end-user delegation. */
+export type EmbedCallOptions = Pick<CallOptions, "signal">;
+
+export interface Collection {
+  id: string;
+  model: string;
+  dimensions: number;
+}
+
+export interface Sync {
+  id: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+  prefix: string;
+  attempts: number;
+  result?: {
+    ingested: number;
+    refreshed: number;
+    removed: number;
+    failed: number;
+  };
+  errorCode?: string;
+}
+
+export interface SearchHit {
+  chunkId: string;
+  key: string;
+  revision: string;
+  start: number;
+  end: number;
+  text: string;
+  score: number;
+}
+
+/** The bae6-context embed API: tenant-scoped sync and search over configured collections. */
+export class EmbedClient {
+  readonly #http: Transport;
+
+  constructor(options: ContextOptions) {
+    this.#http = new Transport(options);
+  }
+
+  /** Provisions the configured collection's storage; a no-op when it exists. */
+  async createCollection(
+    collectionId: string,
+    options: EmbedCallOptions = {},
+  ): Promise<Collection> {
+    const body = await this.#http.request(
+      "PUT",
+      collection(collectionId),
+      signal(options),
+    );
+    if (
+      !isObject(body) ||
+      typeof body.id !== "string" ||
+      typeof body.model !== "string" ||
+      !Number.isInteger(body.dimensions)
+    ) {
+      throw invalid();
+    }
+    return body as unknown as Collection;
+  }
+
+  /** Not retried: each call queues a sync. `prefix` also matches keys that extend it. */
+  async startSync(
+    collectionId: string,
+    request: { prefix?: string } = {},
+    options: EmbedCallOptions = {},
+  ): Promise<Sync> {
+    return this.#sync(
+      await this.#http.request("POST", `${collection(collectionId)}/syncs`, {
+        body: request,
+        ...signal(options),
+      }),
+    );
+  }
+
+  async getSync(
+    collectionId: string,
+    syncId: string,
+    options: EmbedCallOptions = {},
+  ): Promise<Sync> {
+    return this.#sync(
+      await this.#http.request(
+        "GET",
+        `${collection(collectionId)}/syncs/${segment(syncId)}`,
+        signal(options),
+      ),
+    );
+  }
+
+  /** Ranked for the workload token's subject: only chunks that subject may read are returned. */
+  async search(
+    collectionId: string,
+    request: { query: string; limit?: number },
+    options: EmbedCallOptions = {},
+  ): Promise<SearchHit[]> {
+    const body = await this.#http.request(
+      "POST",
+      `${collection(collectionId)}/search`,
+      { body: request, ...signal(options) },
+    );
+    if (!isObject(body) || !Array.isArray(body.hits)) throw invalid();
+    if (!body.hits.every((h) => isObject(h) && typeof h.chunkId === "string")) {
+      throw invalid();
+    }
+    return body.hits as SearchHit[];
+  }
+
+  /** Removes the key from the index only; the source object is untouched. */
+  async deleteDocument(
+    collectionId: string,
+    key: string,
+    options: EmbedCallOptions = {},
+  ): Promise<void> {
+    await this.#http.raw(
+      "DELETE",
+      `${collection(collectionId)}/documents?${new URLSearchParams({ key })}`,
+      signal(options),
+    );
+  }
+
+  #sync(body: unknown): Sync {
+    if (
+      !isObject(body) ||
+      typeof body.id !== "string" ||
+      !SYNC_STATES.includes(body.state as string)
+    ) {
+      throw invalid();
+    }
+    return body as unknown as Sync;
+  }
+}
+
 const signal = (o: CallOptions) => (o.signal ? { signal: o.signal } : {});
 
 function target(key: string, versionId: string | undefined) {

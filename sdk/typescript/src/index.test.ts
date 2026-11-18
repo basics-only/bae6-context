@@ -16,6 +16,7 @@ import {
   ContextTimeoutError,
   ContextTransportError,
   DataClient,
+  EmbedClient,
   Transport,
 } from "./index.js";
 
@@ -261,4 +262,85 @@ test("lists and stats objects", async () => {
   const listed = await data().sources();
   assert.equal(listed.items[0]?.id, "db");
   assert.deepEqual(listed.unavailable, ["lake"]);
+});
+
+const embed = () =>
+  new EmbedClient({ baseUrl: base, credentials: "svc-token" });
+const sync = { id: "s1", state: "queued", prefix: "docs/", attempts: 0 };
+
+test("embed calls hit the documented routes and encode caller-controlled parts", async () => {
+  seen = [];
+  reply = json(200, { id: "kb", model: "m", dimensions: 8 });
+  assert.equal((await embed().createCollection("kb")).dimensions, 8);
+  reply = json(202, sync);
+  await embed().startSync("kb", { prefix: "docs/" });
+  reply = json(200, sync);
+  await embed().getSync("kb", "s/1");
+  reply = (res) => {
+    res.writeHead(204);
+    res.end();
+  };
+  await embed().deleteDocument("kb", "a b&c.txt");
+  assert.deepEqual(
+    seen.map((s) => [s.method, s.url]),
+    [
+      ["PUT", "/v1/collections/kb"],
+      ["POST", "/v1/collections/kb/syncs"],
+      ["GET", "/v1/collections/kb/syncs/s%2F1"],
+      ["DELETE", "/v1/collections/kb/documents?key=a+b%26c.txt"],
+    ],
+  );
+  assert.deepEqual(JSON.parse(seen[1]?.body ?? ""), { prefix: "docs/" });
+});
+
+test("search returns hits and never sends an end-user token", async () => {
+  seen = [];
+  const hit = {
+    chunkId: "c",
+    key: "k",
+    revision: "r",
+    start: 0,
+    end: 1,
+    text: "t",
+    score: 0.5,
+  };
+  reply = json(200, { hits: [hit] });
+  assert.deepEqual(await embed().search("kb", { query: "q", limit: 3 }), [hit]);
+  assert.deepEqual(JSON.parse(seen[0]?.body ?? ""), { query: "q", limit: 3 });
+  assert.equal(seen[0]?.headers["bae6-end-user-token"], undefined);
+});
+
+test("embed errors surface the envelope, a bad body is invalid and a queued sync is not retried", async () => {
+  seen = [];
+  reply = json(404, {
+    code: "not_found",
+    message: "Not found.",
+    requestId: "r1",
+  });
+  await assert.rejects(embed().search("nope", { query: "q" }), {
+    status: 404,
+    code: "not_found",
+    requestId: "r1",
+  });
+  reply = json(200, { nothits: [] });
+  await assert.rejects(
+    embed().search("kb", { query: "q" }),
+    ContextInvalidResponseError,
+  );
+  seen = [];
+  reply = json(503, { code: "unavailable", message: "x" });
+  await assert.rejects(embed().startSync("kb"), ContextApiError);
+  assert.equal(seen.length, 1);
+});
+
+test("embed refuses dot segments and unknown sync states", async () => {
+  seen = [];
+  await assert.rejects(embed().getSync("..", "s1"), ContextError);
+  await assert.rejects(embed().search(".", { query: "q" }), ContextError);
+  assert.equal(seen.length, 0);
+  reply = json(200, { ...sync, state: "bogus" });
+  await assert.rejects(
+    embed().getSync("kb", "s1"),
+    ContextInvalidResponseError,
+  );
 });
