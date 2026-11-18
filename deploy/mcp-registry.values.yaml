@@ -22,7 +22,8 @@ env:
   BAE6_MCP_DB_POOL_MAX: "10"
   # Health probes may only reach hosts under these suffixes. Unset, any public https host
   # is allowed: set it before exposing the registry to publishers you do not control.
-  BAE6_MCP_ALLOWED_HOST_SUFFIXES: .example.invalid
+  # Comma-separated domains, no leading dot: example.com allows example.com and *.example.com.
+  BAE6_MCP_ALLOWED_HOST_SUFFIXES: example.invalid
   BAE6_MCP_ISSUERS: >-
     [{"issuer":"https://idp.example.invalid/","audience":"bae6-context-mcp","jwksUri":"https://idp.example.invalid/.well-known/jwks.json","organization":"example","application":"example-app"}]
 
