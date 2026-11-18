@@ -101,7 +101,7 @@ export class PgJobQueue implements JobQueue {
           [scope.organizationId, scope.collectionId],
         );
         if (known.rowCount === 0) {
-          throw new EmbedError("invalid_request", "unknown collection.");
+          throw new EmbedError("not_found", "unknown collection.");
         }
         await client.query(
           `DELETE FROM jobs WHERE organization_id = $1

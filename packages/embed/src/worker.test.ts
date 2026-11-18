@@ -75,6 +75,7 @@ test("a finished sync is recorded with its result", async () => {
 test("bad requests are permanent failures and other errors are retried", async () => {
   for (const [err, code, retryable] of [
     [new EmbedError("too_large", "x"), "too_large", false],
+    [new EmbedError("not_found", "x"), "not_found", false],
     [new EmbedError("model_error", "x"), "model_error", true],
     [new Error("boom"), "internal", true],
   ] as const) {

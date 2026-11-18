@@ -45,7 +45,7 @@ export interface WorkerOptions {
   maxObjects?: number;
 }
 
-const PERMANENT = new Set(["invalid_request", "too_large"]);
+const PERMANENT = new Set(["invalid_request", "too_large", "not_found"]);
 
 const pause = (ms: number, signal: AbortSignal) =>
   new Promise<void>((ok) => {
