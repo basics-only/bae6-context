@@ -21,6 +21,7 @@ import { type Identity, identify, type Verifier } from "./identity.js";
 export interface BoundCollection {
   id: string;
   organization: string;
+  sourcePrefix: string;
   model: EmbeddingModel;
 }
 
@@ -310,12 +311,19 @@ export function createEmbedApi(deps: EmbedApiDeps) {
     }
 
     if (op === "startSync") {
-      const { prefix = "" } = body;
+      const { prefix = bound.sourcePrefix } = body;
       if (typeof prefix !== "string" || prefix.length > 1024) {
         throw new HttpError(
           400,
           "invalid_request",
           "prefix must be a string of at most 1024 characters.",
+        );
+      }
+      if (!prefix.startsWith(bound.sourcePrefix)) {
+        throw new HttpError(
+          400,
+          "invalid_request",
+          "prefix is outside this collection's source.",
         );
       }
       try {

@@ -71,8 +71,8 @@ const logs: Record<string, unknown>[] = [];
 const server = createEmbedApi({
   verify: async (t) => (t ? (identities[t] ?? null) : null),
   collections: [
-    { id: "kb", organization: "acme", model },
-    { id: "kb", organization: "globex", model },
+    { id: "kb", organization: "acme", sourcePrefix: "docs/", model },
+    { id: "kb", organization: "globex", sourcePrefix: "", model },
   ],
   index: {
     upsert: async () => {},
@@ -95,7 +95,7 @@ const server = createEmbedApi({
   },
   queue: {
     enqueue: async (scope, prefix) => {
-      if (prefix === "full/") throw new EmbedError("too_large", "backlog");
+      if (prefix === "docs/full/") throw new EmbedError("too_large", "backlog");
       return { ...job, scope, prefix, state: "queued", attempts: 0 };
     },
     get: async (scope, id) =>
@@ -258,12 +258,14 @@ test("a failing model is 503 and does not leak its message", async () => {
 test("a sync is queued for the caller's own collection, with or without a body", async () => {
   const bare = await call("POST", "/v1/collections/kb/syncs", "writer");
   assert.equal(bare.status, 202);
-  assert.equal(((await bare.json()) as Job).prefix, "");
+  assert.equal(((await bare.json()) as Job).prefix, "docs/");
   const scoped = await call("POST", "/v1/collections/kb/syncs", "writer", {
-    prefix: "docs/",
+    prefix: "docs/guides/",
   });
-  assert.equal(((await scoped.json()) as Job).prefix, "docs/");
+  assert.equal(((await scoped.json()) as Job).prefix, "docs/guides/");
   for (const body of [
+    { prefix: "other/" },
+    { prefix: "" },
     { prefix: 1 },
     { prefix: "x".repeat(1025) },
     { extra: 1 },
@@ -279,7 +281,7 @@ test("a sync is queued for the caller's own collection, with or without a body",
 
 test("a full backlog is a 429 with a retry hint", async () => {
   const res = await call("POST", "/v1/collections/kb/syncs", "writer", {
-    prefix: "full/",
+    prefix: "docs/full/",
   });
   assert.deepEqual([res.status, res.headers.get("retry-after")], [429, "30"]);
 });

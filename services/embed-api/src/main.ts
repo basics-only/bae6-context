@@ -123,6 +123,7 @@ const model = (c: CollectionConfig) =>
 const collections: BoundCollection[] = config.map((c) => ({
   id: c.id,
   organization: c.organization,
+  sourcePrefix: c.source.prefix,
   model: model(c),
 }));
 
