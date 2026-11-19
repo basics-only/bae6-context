@@ -117,7 +117,7 @@ export class EmbedError extends Error {
 }
 
 export const MAX_PRINCIPALS = 64;
-const PRINCIPAL = /^(user|group):[A-Za-z0-9._@:+-]{1,256}$/;
+const PRINCIPAL = /^(user|group|workload):[A-Za-z0-9._@:+-]{1,256}$/;
 
 export function checkPrincipals(principals: readonly string[]) {
   if (
