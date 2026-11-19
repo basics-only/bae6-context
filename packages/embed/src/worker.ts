@@ -129,6 +129,7 @@ export class Worker {
     } else {
       const code = failure instanceof EmbedError ? failure.code : "internal";
       await this.queue.fail(job.id, lease, code, !PERMANENT.has(code));
+      if (!(failure instanceof EmbedError)) this.opts.onError(failure);
     }
     return true;
   }

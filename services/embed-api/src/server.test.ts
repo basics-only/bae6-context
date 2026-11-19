@@ -268,6 +268,7 @@ test("a sync is queued for the caller's own collection, with or without a body",
     { prefix: "" },
     { prefix: 1 },
     { prefix: "x".repeat(1025) },
+    { prefix: `docs/${"é".repeat(600)}` },
     { extra: 1 },
   ]) {
     assert.deepEqual(
