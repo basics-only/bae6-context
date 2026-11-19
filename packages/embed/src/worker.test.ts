@@ -80,10 +80,31 @@ test("bad requests are permanent failures and other errors are retried", async (
     [new Error("boom"), "internal", true],
   ] as const) {
     const { queue, calls } = fakeQueue();
-    await worker(queue, async () => {
-      throw err;
-    }).runOnce(new AbortController().signal);
+    await worker(
+      queue,
+      async () => {
+        throw err;
+      },
+      { onError: () => {} },
+    ).runOnce(new AbortController().signal);
     assert.deepEqual(calls, [["fail", "j1", "L1", code, retryable]]);
+  }
+});
+
+test("a failure that is not a classified embed error is reported, a classified one is not", async () => {
+  for (const [err, reported] of [
+    [new Error("boom"), 1],
+    [new EmbedError("too_large", "x"), 0],
+  ] as const) {
+    const errors: unknown[] = [];
+    await worker(
+      fakeQueue().queue,
+      async () => {
+        throw err;
+      },
+      { onError: (e: unknown) => errors.push(e) },
+    ).runOnce(new AbortController().signal);
+    assert.equal(errors.length, reported);
   }
 });
 
