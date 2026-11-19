@@ -43,6 +43,9 @@ const suffixes = (env.BAE6_MCP_ALLOWED_HOST_SUFFIXES ?? "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+if (suffixes.length === 0 && !allowInsecure) {
+  throw new Error("BAE6_MCP_ALLOWED_HOST_SUFFIXES is required");
+}
 const policy: EgressPolicy = {
   ...(suffixes.length > 0 ? { allowedHostSuffixes: suffixes } : {}),
   ...(allowInsecure ? { allowInsecure } : {}),
