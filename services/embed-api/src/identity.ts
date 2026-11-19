@@ -131,6 +131,9 @@ export function createVerifier(
   };
 }
 
+export const principalOf = (who: Identity) =>
+  `${who.subjectType}:${who.subjectId}`;
+
 /**
  * The caller's identity. With `Bae6-End-User-Token` the user is the subject, and both
  * tokens must map to the same organization and application (ADR-0003), else null.
