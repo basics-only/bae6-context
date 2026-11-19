@@ -312,11 +312,11 @@ export function createEmbedApi(deps: EmbedApiDeps) {
 
     if (op === "startSync") {
       const { prefix = bound.sourcePrefix } = body;
-      if (typeof prefix !== "string" || prefix.length > 1024) {
+      if (typeof prefix !== "string" || Buffer.byteLength(prefix) > 1024) {
         throw new HttpError(
           400,
           "invalid_request",
-          "prefix must be a string of at most 1024 characters.",
+          "prefix must be a string of at most 1024 bytes.",
         );
       }
       if (!prefix.startsWith(bound.sourcePrefix)) {

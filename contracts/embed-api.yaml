@@ -257,7 +257,7 @@ components:
       additionalProperties: false
       properties:
         prefix:
-          description: Must start with the source's own prefix. Absent means the source's own prefix, which syncs everything.
+          description: Must start with the source's own prefix. Absent means the source's own prefix, which syncs everything. At most 1024 bytes when UTF-8 encoded.
           type: string
           maxLength: 1024
     SyncResult:
