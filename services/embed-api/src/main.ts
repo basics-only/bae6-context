@@ -55,9 +55,6 @@ if (!rawConfig) {
 const config = parseConfig(JSON.parse(rawConfig));
 
 const aiUrl = required("BAE6_AI_URL");
-if (new URL(aiUrl).protocol !== "https:" && !allowHttp) {
-  throw new Error("BAE6_AI_URL must be https");
-}
 const aiTokenFile = env.BAE6_AI_TOKEN_FILE;
 const aiToken = env.BAE6_AI_TOKEN?.trim();
 if (!aiTokenFile === !aiToken) {
