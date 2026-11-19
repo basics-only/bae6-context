@@ -257,7 +257,7 @@ components:
       additionalProperties: false
       properties:
         prefix:
-          description: Within the source's own prefix. Empty or absent syncs everything.
+          description: Must start with the source's own prefix. Absent means the source's own prefix, which syncs everything.
           type: string
           maxLength: 1024
     SyncResult:
