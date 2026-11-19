@@ -196,3 +196,27 @@ test("refuses a non-https or non-bare endpoint", () => {
     );
   }
 });
+
+test("sends credentials only to AWS hosts unless development allows otherwise", () => {
+  const cfg = {
+    id: "s3",
+    region,
+    bucket: "abc",
+    prefix: "",
+    credentials: async () => credentials,
+  };
+  assert.throws(
+    () => createS3Source({ ...cfg, endpoint: "https://s3.example.com" }),
+    /not an AWS host/,
+  );
+  assert.doesNotThrow(() =>
+    createS3Source({ ...cfg, endpoint: "https://s3.eu-west-1.amazonaws.com" }),
+  );
+  assert.doesNotThrow(() =>
+    createS3Source({
+      ...cfg,
+      endpoint: "https://s3.example.com",
+      allowHttp: true,
+    }),
+  );
+});

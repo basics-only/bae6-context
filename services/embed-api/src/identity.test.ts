@@ -2,8 +2,14 @@ import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
+import { checkPrincipals } from "@bae6/context-embed";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
-import { createVerifier, identify, type Verifier } from "./identity.js";
+import {
+  createVerifier,
+  identify,
+  principalOf,
+  type Verifier,
+} from "./identity.js";
 
 let server: Server;
 let verify: Verifier;
@@ -124,4 +130,13 @@ test("refuses issuer config without an audience, which would skip the check", ()
       /non-empty (audience|issuer)/,
     );
   }
+});
+
+test("a workload and a user with the same subject do not share an ACL principal", async () => {
+  const workload = await verify(await token({ client_id: "svc" }));
+  const user = await verify(await token({}));
+  assert.ok(workload && user);
+  assert.equal(principalOf(workload), "workload:svc");
+  assert.equal(principalOf(user), "user:svc");
+  assert.deepEqual(checkPrincipals([principalOf(workload)]), ["workload:svc"]);
 });

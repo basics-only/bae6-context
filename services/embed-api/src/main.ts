@@ -7,7 +7,7 @@ import { prefixAcl, Worker } from "@bae6/context-embed";
 import { PgJobQueue, PgVectorIndex } from "@bae6/context-embed-pgvector";
 import pg from "pg";
 import { type CollectionConfig, parseConfig } from "./config.js";
-import { createVerifier, type Issuer } from "./identity.js";
+import { createVerifier, type Issuer, principalOf } from "./identity.js";
 import { createAiEmbeddingModel } from "./model.js";
 import { type BoundCollection, createEmbedApi } from "./server.js";
 
@@ -162,7 +162,7 @@ const server = createEmbedApi({
   collections,
   index,
   queue,
-  principals: (who) => [`user:${who.subjectId}`],
+  principals: (who) => [principalOf(who)],
   ping: async () => void (await pool.query("SELECT 1")),
   maxAclAgeMs,
   maxInflight,
