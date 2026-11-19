@@ -53,6 +53,10 @@ if (!rawConfig) {
   throw new Error("BAE6_EMBED_CONFIG or BAE6_EMBED_CONFIG_FILE is required");
 }
 const config = parseConfig(JSON.parse(rawConfig));
+// One AI token serves every collection, so it must not span organizations.
+if (new Set(config.map((c) => c.organization)).size > 1) {
+  throw new Error("BAE6_EMBED_CONFIG must name a single organization");
+}
 
 const aiUrl = required("BAE6_AI_URL");
 const ai = new URL(aiUrl);

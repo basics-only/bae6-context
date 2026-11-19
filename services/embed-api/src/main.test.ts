@@ -41,3 +41,26 @@ test("accepts https and in-cluster http AI gateway URLs", () => {
     assert.doesNotMatch(start({ BAE6_AI_URL: url }).stderr, refusal, url);
   }
 });
+
+test("refuses a config spanning organizations, which would share one AI token", () => {
+  const collection = (organization: string) => ({
+    id: "kb",
+    organization,
+    model: { id: "m", dimensions: 8 },
+    source: { region: "us-east-1", bucket: "b", prefix: "" },
+    acl: [],
+  });
+  const config = (...orgs: string[]) =>
+    JSON.stringify({ collections: orgs.map(collection) });
+  const env = { BAE6_AI_URL: "https://ai.example.com" };
+  const refused = start({
+    ...env,
+    BAE6_EMBED_CONFIG: config("acme", "globex"),
+  });
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /single organization/);
+  assert.doesNotMatch(
+    start({ ...env, BAE6_EMBED_CONFIG: config("acme") }).stderr,
+    /single organization/,
+  );
+});
