@@ -1,0 +1,163 @@
+openapi: 3.1.0
+info:
+  title: bae6-context MCP gateway API
+  version: 1.0.0
+  summary: Calls a tool on an approved MCP server that needs no authentication.
+  description: |
+    The gateway executes calls the registry only catalogs (ADR 0006). It is optional; the
+    registry does not depend on it.
+
+    **Identity.** The workload is identified by its bearer token and needs `mcp:invoke`. The
+    organization comes from the token issuer's configuration, never from claims or bodies.
+    A server of another organization is `404 not_found`, the same as one that does not exist.
+
+    **Authorization.** A call needs an approved version (the latest approved, or the one named
+    by `version`) and a tool that version declares. Anything else is refused before the
+    network is touched. Approving a server that declares `none` lets every holder of
+    `mcp:invoke` in the organization call its declared tools.
+
+    **Upstream authentication.** Only `none` is supported. A version declaring `oauth2` is
+    `409 upstream_auth_unsupported`. The caller's token and any other credential are never
+    sent upstream.
+
+    **Egress.** The endpoint is checked against the operator's egress policy at call time,
+    resolved to public addresses only, and redirects are refused.
+
+    **Results.** The tool's result is untrusted data, returned unmodified. Upstream error
+    text never appears in responses; failures carry a fixed code.
+
+    **Limits.** Request bodies are at most 64 KiB and upstream replies at most 1 MiB. Each
+    call has a deadline and is never retried. Over-limit requests are refused, never clamped.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://localhost:8080
+    description: Local development
+security:
+  - bearer: []
+paths:
+  /health/live:
+    $ref: "./vendor/openapi/common.yaml#/paths/~1health~1live"
+  /health/ready:
+    $ref: "./vendor/openapi/common.yaml#/paths/~1health~1ready"
+  /v1/servers/{serverId}/tools/call:
+    post:
+      operationId: callTool
+      summary: Calls a declared tool on an approved server. Needs `mcp:invoke`.
+      parameters:
+        - $ref: "#/components/parameters/ServerId"
+        - $ref: "#/components/parameters/EndUserToken"
+        - $ref: "./vendor/openapi/common.yaml#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CallToolRequest"
+      responses:
+        "200":
+          description: The tool ran. A tool that reports its own failure is still `200`; read `result`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallToolResponse"
+        "400":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Forbidden"
+        "404":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/NotFound"
+        "409":
+          description: |
+            `upstream_auth_unsupported`: the version declares authentication other than `none`.
+          headers:
+            X-Request-Id:
+              $ref: "./vendor/openapi/common.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./vendor/openapi/common.yaml#/components/schemas/ErrorEnvelope"
+        "413":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/RateLimited"
+        "502":
+          description: |
+            The upstream failed. `code` is one of `upstream_blocked`, `upstream_unreachable`,
+            `upstream_bad_response`, `upstream_too_large` or `upstream_rejected`.
+          headers:
+            X-Request-Id:
+              $ref: "./vendor/openapi/common.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./vendor/openapi/common.yaml#/components/schemas/ErrorEnvelope"
+        "503":
+          $ref: "./vendor/openapi/common.yaml#/components/responses/Unavailable"
+        "504":
+          description: "`upstream_timeout`: the call did not finish within the gateway's deadline."
+          headers:
+            X-Request-Id:
+              $ref: "./vendor/openapi/common.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./vendor/openapi/common.yaml#/components/schemas/ErrorEnvelope"
+components:
+  securitySchemes:
+    bearer:
+      $ref: "./vendor/openapi/common.yaml#/components/securitySchemes/bearer"
+  parameters:
+    ServerId:
+      name: serverId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ServerId"
+    EndUserToken:
+      name: Bae6-End-User-Token
+      in: header
+      description: Optional verified user token; the user becomes the subject.
+      schema:
+        type: string
+        maxLength: 8192
+  schemas:
+    ServerId:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9._-]{0,63}$"
+    VersionName:
+      type: string
+      pattern: "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+    ToolName:
+      type: string
+      minLength: 1
+      maxLength: 128
+    CallToolRequest:
+      type: object
+      required: [tool]
+      additionalProperties: false
+      properties:
+        tool:
+          $ref: "#/components/schemas/ToolName"
+        arguments:
+          description: Passed to the tool as is. Defaults to an empty object.
+          type: object
+        version:
+          description: Pins an approved version. Absent means the latest approved.
+          $ref: "#/components/schemas/VersionName"
+    CallToolResponse:
+      type: object
+      required: [server, version, tool, result]
+      additionalProperties: false
+      properties:
+        server:
+          $ref: "#/components/schemas/ServerId"
+        version:
+          $ref: "#/components/schemas/VersionName"
+        tool:
+          $ref: "#/components/schemas/ToolName"
+        result:
+          description: The MCP `tools/call` result, unmodified and untrusted.
