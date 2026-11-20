@@ -67,13 +67,16 @@ export function createEntries(o: EntriesOptions): Entries {
   };
 }
 
-async function readBounded(res: Response, maxBytes: number): Promise<string> {
+export async function readBounded(
+  res: Response,
+  maxBytes: number,
+): Promise<string> {
   const chunks: Uint8Array[] = [];
   let size = 0;
   for await (const chunk of res.body ?? []) {
     size += chunk.length;
     if (size > maxBytes) {
-      throw new RegistryUnavailable("registry reply too large");
+      throw new RegistryUnavailable("reply too large");
     }
     chunks.push(chunk);
   }

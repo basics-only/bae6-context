@@ -20,7 +20,7 @@ const start = (env: Record<string, string>) =>
 
 const configured = {
   BAE6_MCP_REGISTRY_URL: "http://registry.invalid",
-  BAE6_MCP_REGISTRY_TOKENS: "{}",
+  BAE6_MCP_REGISTRY_CREDENTIALS: "{}",
 };
 
 test("refuses to start without an egress host allowlist", () => {
@@ -32,20 +32,27 @@ test("refuses to start without an egress host allowlist", () => {
 test("refuses to start without a registry to read approvals from", () => {
   const res = start({
     BAE6_MCP_ALLOWED_HOST_SUFFIXES: "example.com",
-    BAE6_MCP_REGISTRY_TOKENS: "{}",
+    BAE6_MCP_REGISTRY_CREDENTIALS: "{}",
   });
   assert.notEqual(res.status, 0);
   assert.match(res.stderr, /BAE6_MCP_REGISTRY_URL must be an http\(s\) URL/);
 });
 
-test("refuses registry tokens that are not an organization map", () => {
-  const res = start({
-    ...configured,
-    BAE6_MCP_ALLOWED_HOST_SUFFIXES: "example.com",
-    BAE6_MCP_REGISTRY_TOKENS: '["/x"]',
-  });
-  assert.notEqual(res.status, 0);
-  assert.match(res.stderr, /BAE6_MCP_REGISTRY_TOKENS must be/);
+test("refuses registry credentials that are not complete or not https", () => {
+  const cases = [
+    '["/x"]',
+    '{"acme":{"tokenUrl":"https://idp.example.com/t","clientId":"gw"}}',
+    '{"acme":{"tokenUrl":"http://idp.example.com/t","clientId":"gw","clientSecret":"s"}}',
+  ];
+  for (const credentials of cases) {
+    const res = start({
+      ...configured,
+      BAE6_MCP_ALLOWED_HOST_SUFFIXES: "example.com",
+      BAE6_MCP_REGISTRY_CREDENTIALS: credentials,
+    });
+    assert.notEqual(res.status, 0, credentials);
+    assert.match(res.stderr, /BAE6_MCP_REGISTRY_CREDENTIALS must be/);
+  }
 });
 
 test("starts past the allowlist check when one is configured", () => {

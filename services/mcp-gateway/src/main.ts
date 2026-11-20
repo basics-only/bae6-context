@@ -1,4 +1,5 @@
 import type { EgressPolicy } from "@bae6/context-mcp";
+import { type ClientCredentials, createTokenSource } from "./credentials.js";
 import { createEntries } from "./entries.js";
 import { createVerifier, type Issuer } from "./identity.js";
 import { createGateway } from "./server.js";
@@ -45,19 +46,31 @@ const registryUrl = env.BAE6_MCP_REGISTRY_URL;
 if (!registryUrl || !/^https?:\/\//.test(registryUrl)) {
   throw new Error("BAE6_MCP_REGISTRY_URL must be an http(s) URL");
 }
-const registryTokens = json("BAE6_MCP_REGISTRY_TOKENS") as Record<
+const registryCredentials = json("BAE6_MCP_REGISTRY_CREDENTIALS") as Record<
   string,
-  string
+  ClientCredentials
 > | null;
+const credentialsError =
+  "BAE6_MCP_REGISTRY_CREDENTIALS must be a JSON object of organization to {tokenUrl,clientId,clientSecret,scope?}";
 if (
-  typeof registryTokens !== "object" ||
-  registryTokens === null ||
-  Array.isArray(registryTokens) ||
-  !Object.values(registryTokens).every((t) => typeof t === "string" && t !== "")
+  typeof registryCredentials !== "object" ||
+  registryCredentials === null ||
+  Array.isArray(registryCredentials)
 ) {
-  throw new Error(
-    "BAE6_MCP_REGISTRY_TOKENS must be a JSON object of organization to registry token",
-  );
+  throw new Error(credentialsError);
+}
+for (const c of Object.values(registryCredentials)) {
+  const ok =
+    typeof c === "object" &&
+    c !== null &&
+    typeof c.tokenUrl === "string" &&
+    (allowHttpJwks ? /^https?:\/\// : /^https:\/\//).test(c.tokenUrl) &&
+    typeof c.clientId === "string" &&
+    c.clientId !== "" &&
+    typeof c.clientSecret === "string" &&
+    c.clientSecret !== "" &&
+    (c.scope === undefined || typeof c.scope === "string");
+  if (!ok) throw new Error(credentialsError);
 }
 const suffixes = (env.BAE6_MCP_ALLOWED_HOST_SUFFIXES ?? "")
   .split(",")
@@ -92,10 +105,11 @@ const server = createGateway({
   verify: createVerifier(issuers, { allowHttpJwks }),
   entries: createEntries({
     registryUrl,
-    token: async (organization) =>
-      Object.hasOwn(registryTokens, organization)
-        ? registryTokens[organization]
-        : undefined,
+    token: createTokenSource({
+      credentials: registryCredentials,
+      timeoutMs: 5000,
+      maxBytes: 64 * 1024,
+    }),
     ttlMs: int("BAE6_MCP_CACHE_TTL_MS", 30_000, 1000, 300_000),
     timeoutMs: 5000,
     maxBytes: 1024 * 1024,

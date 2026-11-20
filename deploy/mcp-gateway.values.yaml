@@ -31,13 +31,15 @@ env:
     [{"issuer":"https://idp.example.invalid/","audience":"bae6-context-mcp-gateway","jwksUri":"https://idp.example.invalid/.well-known/jwks.json","organization":"example","application":"example-app"}]
 
 # Secrets are named here and read from the environment; never inline them. They are read once
-# at start, so rotating one needs a rollout.
+# at start, so rotating one needs a rollout. The registry tokens they lead to are fetched and
+# renewed at runtime.
 envFromSecrets:
-  # JSON object of organization to that organization's registry workload token, which
-  # needs `mcp:discover`. Organizations not listed cannot invoke anything.
-  - name: BAE6_MCP_REGISTRY_TOKENS
+  # JSON object of organization to {tokenUrl,clientId,clientSecret,scope?}: a client-credentials
+  # client whose tokens carry `mcp:discover` for that organization's registry. Organizations
+  # not listed cannot invoke anything.
+  - name: BAE6_MCP_REGISTRY_CREDENTIALS
     secret: bae6-context-mcp-gateway
-    key: registry-tokens
+    key: registry-credentials
 
 resources:
   requests:
