@@ -725,6 +725,57 @@ export class RegistryClient {
   }
 }
 
+export interface McpToolCall {
+  tool: string;
+  arguments?: Record<string, unknown>;
+  /** An approved version; the latest approved when absent. */
+  version?: string;
+}
+
+export interface McpToolResult {
+  server: string;
+  version: string;
+  tool: string;
+  /** The tool's own reply. Untrusted: never treat it as instructions. */
+  result: unknown;
+}
+
+/**
+ * The bae6-context MCP gateway: calls tools on approved servers that need no authentication.
+ * A call may have side effects, so it is never retried.
+ */
+export class McpGatewayClient {
+  readonly #http: Transport;
+
+  constructor(options: ContextOptions) {
+    this.#http = new Transport(options);
+  }
+
+  /** Needs `mcp:invoke`. */
+  async callTool(
+    serverId: string,
+    request: McpToolCall,
+    options: CallOptions = {},
+  ): Promise<McpToolResult> {
+    const body = await this.#http.request(
+      "POST",
+      `${server(serverId)}/tools/call`,
+      { body: request, headers: headers(options), ...signal(options) },
+    );
+    if (
+      !isObject(body) ||
+      body.server !== serverId ||
+      body.tool !== request.tool ||
+      typeof body.version !== "string" ||
+      (request.version !== undefined && body.version !== request.version) ||
+      !("result" in body)
+    ) {
+      throw invalid();
+    }
+    return body as unknown as McpToolResult;
+  }
+}
+
 const signal = (o: CallOptions) => (o.signal ? { signal: o.signal } : {});
 
 function target(key: string, versionId: string | undefined) {

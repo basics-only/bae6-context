@@ -17,6 +17,7 @@ import {
   ContextTransportError,
   DataClient,
   EmbedClient,
+  McpGatewayClient,
   RegistryClient,
   Transport,
 } from "./index.js";
@@ -525,4 +526,70 @@ test("a dropped connection on a registry mutation is not retried", async () => {
   reply = (res) => res.destroy();
   await assert.rejects(registry().revokeVersion("docs"), ContextTransportError);
   assert.equal(seen.length, 1);
+});
+
+const gateway = () =>
+  new McpGatewayClient({ baseUrl: base, credentials: "svc-token" });
+
+test("callTool posts to the documented route with the end-user token and returns the result", async () => {
+  seen = [];
+  reply = json(200, {
+    server: "docs",
+    version: "1.0.0",
+    tool: "echo",
+    result: { content: [] },
+  });
+  const out = await gateway().callTool(
+    "docs",
+    { tool: "echo", arguments: { a: 1 }, version: "1.0.0" },
+    { endUserToken: "user-token" },
+  );
+  assert.deepEqual(out.result, { content: [] });
+  assert.equal(seen[0]?.method, "POST");
+  assert.equal(seen[0]?.url, "/v1/servers/docs/tools/call");
+  assert.equal(seen[0]?.headers["bae6-end-user-token"], "user-token");
+  assert.deepEqual(JSON.parse(seen[0]?.body ?? ""), {
+    tool: "echo",
+    arguments: { a: 1 },
+    version: "1.0.0",
+  });
+});
+
+test("callTool is never retried and surfaces the envelope", async () => {
+  seen = [];
+  reply = json(504, {
+    code: "upstream_timeout",
+    message: "x",
+    requestId: "r9",
+  });
+  await assert.rejects(gateway().callTool("docs", { tool: "echo" }), {
+    status: 504,
+    code: "upstream_timeout",
+    requestId: "r9",
+  });
+  reply = (res) => res.destroy();
+  await assert.rejects(
+    gateway().callTool("docs", { tool: "echo" }),
+    ContextTransportError,
+  );
+  assert.equal(seen.length, 2);
+});
+
+test("callTool refuses dot segments and a reply about another server, tool or version", async () => {
+  seen = [];
+  await assert.rejects(gateway().callTool("..", { tool: "echo" }));
+  assert.equal(seen.length, 0);
+  const good = { server: "docs", version: "1.0.0", tool: "echo", result: 1 };
+  for (const bad of [
+    { ...good, server: "other" },
+    { ...good, tool: "rm" },
+    { ...good, version: "2.0.0" },
+    { server: "docs", version: "1.0.0", tool: "echo" },
+  ]) {
+    reply = json(200, bad);
+    await assert.rejects(
+      gateway().callTool("docs", { tool: "echo", version: "1.0.0" }),
+      ContextInvalidResponseError,
+    );
+  }
 });
