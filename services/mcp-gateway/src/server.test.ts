@@ -304,6 +304,31 @@ test("an organization over its in-flight cap is told to retry, and others are no
   assert.equal((await first).status, 200);
 });
 
+test("a caller that disconnects mid-call keeps its slot until the upstream call ends", async () => {
+  reset();
+  let release!: () => void;
+  upstreamResult = () =>
+    new Promise((r) => {
+      release = () => r({});
+    });
+  const abort = new AbortController();
+  const first = fetch(`${base}/v1/servers/tools/tools/call`, {
+    method: "POST",
+    headers: { authorization: "Bearer caller" },
+    body: JSON.stringify({ tool: "echo" }),
+    signal: abort.signal,
+  }).catch(() => null);
+  while (upstreamCalls.length === 0) await new Promise((r) => setTimeout(r, 5));
+  abort.abort();
+  await first;
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal((await post("caller", { tool: "echo" })).status, 429);
+  release();
+  await new Promise((r) => setTimeout(r, 50));
+  upstreamResult = async () => ({});
+  assert.equal((await post("caller", { tool: "echo" })).status, 200);
+});
+
 test("one access event per call carries who, what and the outcome but not arguments or results", async () => {
   reset();
   upstreamResult = async () => ({ secret: "result-data" });

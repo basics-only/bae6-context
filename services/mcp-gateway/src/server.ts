@@ -111,10 +111,12 @@ export function createGateway(deps: GatewayDeps) {
     }
     inflight++;
     perOrg.set(org, orgUsed + 1);
-    res.once("close", () => {
+    // Held until the work ends, not until the client leaves: an abandoned call still
+    // occupies an upstream connection.
+    return () => {
       inflight--;
       perOrg.set(org, (perOrg.get(org) ?? 1) - 1);
-    });
+    };
   }
 
   async function route(
@@ -184,8 +186,22 @@ export function createGateway(deps: GatewayDeps) {
     );
     Object.assign(access, { tool: call.tool });
     const org = who.organizationId;
-    admit(res, org);
+    const release = admit(res, org);
+    try {
+      await invoke(res, requestId, org, id, call, access);
+    } finally {
+      release();
+    }
+  }
 
+  async function invoke(
+    res: ServerResponse,
+    requestId: string,
+    org: string,
+    id: string,
+    call: ReturnType<typeof parseCall>,
+    access: Record<string, unknown>,
+  ) {
     let server: Awaited<ReturnType<Entries>>;
     try {
       server = await deps.entries(org, id);
