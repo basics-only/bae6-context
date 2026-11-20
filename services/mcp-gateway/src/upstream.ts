@@ -171,16 +171,16 @@ export function createUpstream(o: UpstreamOptions) {
         capabilities: {},
         clientInfo: { name: "bae6-mcp-gateway", version: "0.0.0" },
       });
-      const negotiated = messageFor(init, 1) as {
-        protocolVersion?: unknown;
-      } | null;
-      if (negotiated?.protocolVersion !== call.protocolVersion) throw bad();
       const id = init.headers["mcp-session-id"];
       if (id !== undefined) {
         if (typeof id !== "string" || !SESSION_ID.test(id)) throw bad();
         session = id;
         headers["mcp-session-id"] = id;
       }
+      const negotiated = messageFor(init, 1) as {
+        protocolVersion?: unknown;
+      } | null;
+      if (negotiated?.protocolVersion !== call.protocolVersion) throw bad();
       headers["mcp-protocol-version"] = call.protocolVersion;
 
       const ack = await send(
