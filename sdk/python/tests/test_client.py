@@ -14,6 +14,7 @@ from bae6_context import (
     ContextTransportError,
     DataClient,
     EmbedClient,
+    McpGatewayClient,
     RegistryClient,
     Transport,
 )
@@ -495,3 +496,93 @@ def test_a_dropped_connection_on_a_registry_mutation_is_not_retried() -> None:
     with pytest.raises(ContextTransportError):
         run_registry(drop, lambda r: r.revoke_version("docs"))
     assert calls == 1
+
+
+def run_gateway(handler, call):
+    async def go():
+        async with McpGatewayClient(
+            "http://ctx", "svc-token", transport=httpx.MockTransport(handler)
+        ) as g:
+            return await call(g)
+
+    return asyncio.run(go())
+
+
+CALLED = {"server": "docs", "version": "1.0.0", "tool": "echo", "result": {"x": 1}}
+
+
+def test_call_tool_posts_to_the_documented_route_with_the_end_user_token() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=CALLED)
+
+    out = run_gateway(
+        handler,
+        lambda g: g.call_tool(
+            "docs", "echo", {"a": 1}, version="1.0.0", end_user_token="user-token"
+        ),
+    )
+    assert out["result"] == {"x": 1}
+    assert (seen[0].method, seen[0].url.path) == ("POST", "/v1/servers/docs/tools/call")
+    assert seen[0].headers["bae6-end-user-token"] == "user-token"
+    assert json.loads(seen[0].content) == {
+        "tool": "echo",
+        "arguments": {"a": 1},
+        "version": "1.0.0",
+    }
+
+
+def test_call_tool_is_never_retried_and_surfaces_the_envelope() -> None:
+    calls = 0
+
+    def timeout(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            504, json={"code": "upstream_timeout", "message": "x", "requestId": "r9"}
+        )
+
+    with pytest.raises(ContextApiError) as err:
+        run_gateway(timeout, lambda g: g.call_tool("docs", "echo"))
+    assert (err.value.status, err.value.code, err.value.request_id) == (
+        504,
+        "upstream_timeout",
+        "r9",
+    )
+
+    def drop(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.RemoteProtocolError("dropped", request=request)
+
+    with pytest.raises(ContextTransportError):
+        run_gateway(drop, lambda g: g.call_tool("docs", "echo"))
+    assert calls == 2
+
+
+def test_call_tool_refuses_dot_segments_and_a_reply_about_another_server_tool_or_version() -> (
+    None
+):
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=CALLED)
+
+    with pytest.raises(ContextError):
+        run_gateway(handler, lambda g: g.call_tool("..", "echo"))
+    assert calls == 0
+    for bad in (
+        {**CALLED, "server": "other"},
+        {**CALLED, "tool": "rm"},
+        {**CALLED, "version": "2.0.0"},
+        {k: v for k, v in CALLED.items() if k != "result"},
+    ):
+        with pytest.raises(ContextInvalidResponseError):
+            run_gateway(
+                lambda _, bad=bad: httpx.Response(200, json=bad),
+                lambda g: g.call_tool("docs", "echo", version="1.0.0"),
+            )
